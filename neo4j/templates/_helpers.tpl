@@ -391,7 +391,7 @@ readinessProbe:
   {{- else if .httpGet }}
   httpGet: {{ toYaml .httpGet | indent 2 }}
   {{- else if .tcpSocket }}
-  tcpSocket: 
+  tcpSocket:
   {{ toYaml .tcpSocket | indent 2 }}
   {{- end }}
   {{- if .initialDelaySeconds }}
@@ -427,7 +427,7 @@ livenessProbe:
   {{- else if .httpGet }}
   httpGet: {{ toYaml .httpGet | indent 2 }}
   {{- else if .tcpSocket }}
-  tcpSocket: 
+  tcpSocket:
   {{ toYaml .tcpSocket | indent 2 }}
   {{- end }}
   {{- if .initialDelaySeconds }}
@@ -463,7 +463,7 @@ startupProbe:
   {{- else if .httpGet }}
   httpGet: {{ toYaml .httpGet | indent 2 }}
   {{- else if .tcpSocket }}
-  tcpSocket: 
+  tcpSocket:
   {{ toYaml .tcpSocket | indent 2 }}
   {{- end }}
   {{- if .initialDelaySeconds }}
