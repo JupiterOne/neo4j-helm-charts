@@ -478,8 +478,8 @@ startupProbe:
   {{- if .successThreshold }}
   successThreshold: {{ .successThreshold }}
   {{- end }}
-  # If no probe action is set, default to using tcpSocket probe to check port 7687 to check if bolt connections can be made
   {{- if not (or .exec .grpc .httpGet .tcpSocket) }}
+  # If no probe action is set, default to using tcpSocket probe to check port 7687 to check if bolt connections can be made
   tcpSocket:
     port: 7687
   {{- end }}
