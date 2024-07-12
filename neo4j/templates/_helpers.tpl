@@ -387,12 +387,12 @@ readinessProbe:
   {{- toYaml .exec | nindent 4 }}  
   {{- else if .grpc }}
   grpc: 
-  {{- toYaml .grpc | indent 4 }}
+  {{- toYaml .grpc | nindent 4 }}
   {{- else if .httpGet }}
-  httpGet: {{ toYaml .httpGet | indent 4 }}
+  httpGet: {{ toYaml .httpGet | nindent 4 }}
   {{- else if .tcpSocket }}
   tcpSocket:
-  {{- toYaml .tcpSocket | indent 4 }}
+  {{- toYaml .tcpSocket | nindent 4 }}
   {{- end }}
   {{- if .initialDelaySeconds }}
   initialDelaySeconds: {{ .initialDelaySeconds }}
@@ -423,12 +423,12 @@ livenessProbe:
   {{- toYaml .exec | nindent 4 }}  
   {{- else if .grpc }}
   grpc: 
-  {{- toYaml .grpc | indent 4 }}
+  {{- toYaml .grpc | nindent 4 }}
   {{- else if .httpGet }}
-  httpGet: {{ toYaml .httpGet | indent 4 }}
+  httpGet: {{ toYaml .httpGet | nindent 4 }}
   {{- else if .tcpSocket }}
   tcpSocket:
-  {{- toYaml .tcpSocket | indent 4 }}
+  {{- toYaml .tcpSocket | nindent 4 }}
   {{- end }}
   {{- if .initialDelaySeconds }}
   initialDelaySeconds: {{ .initialDelaySeconds }}
@@ -459,12 +459,12 @@ startupProbe:
   {{- toYaml .exec | nindent 4 }}  
   {{- else if .grpc }}
   grpc: 
-  {{- toYaml .grpc | indent 4 }}
+  {{- toYaml .grpc | nindent 4 }}
   {{- else if .httpGet }}
-  httpGet: {{ toYaml .httpGet | indent 4 }}
+  httpGet: {{ toYaml .httpGet | nindent 4 }}
   {{- else if .tcpSocket }}
   tcpSocket:
-  {{- toYaml .tcpSocket | indent 4 }}
+  {{- toYaml .tcpSocket | nindent 4 }}
   {{- end }}
   {{- if .initialDelaySeconds }}
   initialDelaySeconds: {{ .initialDelaySeconds }}
