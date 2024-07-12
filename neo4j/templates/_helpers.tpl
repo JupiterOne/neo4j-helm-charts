@@ -384,15 +384,15 @@ readinessProbe:
   # Allow overriding the probe action
   {{- if .exec }}
   exec: 
-  {{ toYaml .exec | indent 2 }}  
+  {{- toYaml .exec | nindent 4 }}  
   {{- else if .grpc }}
   grpc: 
-  {{ toYaml .grpc | indent 2 }}
+  {{- toYaml .grpc | indent 4 }}
   {{- else if .httpGet }}
-  httpGet: {{ toYaml .httpGet | indent 2 }}
+  httpGet: {{ toYaml .httpGet | indent 4 }}
   {{- else if .tcpSocket }}
   tcpSocket:
-  {{ toYaml .tcpSocket | indent 2 }}
+  {{- toYaml .tcpSocket | indent 4 }}
   {{- end }}
   {{- if .initialDelaySeconds }}
   initialDelaySeconds: {{ .initialDelaySeconds }}
@@ -420,15 +420,15 @@ livenessProbe:
   # Allow overriding the probe action
   {{- if .exec }}
   exec: 
-  {{ toYaml .exec | indent 2 }}  
+  {{- toYaml .exec | nindent 4 }}  
   {{- else if .grpc }}
   grpc: 
-  {{ toYaml .grpc | indent 2 }}
+  {{- toYaml .grpc | indent 4 }}
   {{- else if .httpGet }}
-  httpGet: {{ toYaml .httpGet | indent 2 }}
+  httpGet: {{ toYaml .httpGet | indent 4 }}
   {{- else if .tcpSocket }}
   tcpSocket:
-  {{ toYaml .tcpSocket | indent 2 }}
+  {{- toYaml .tcpSocket | indent 4 }}
   {{- end }}
   {{- if .initialDelaySeconds }}
   initialDelaySeconds: {{ .initialDelaySeconds }}
@@ -456,15 +456,15 @@ startupProbe:
   # Allow overriding the probe action
   {{- if .exec }}
   exec: 
-  {{ toYaml .exec | indent 2 }}  
+  {{- toYaml .exec | nindent 4 }}  
   {{- else if .grpc }}
   grpc: 
-  {{ toYaml .grpc | indent 2 }}
+  {{- toYaml .grpc | indent 4 }}
   {{- else if .httpGet }}
-  httpGet: {{ toYaml .httpGet | indent 2 }}
+  httpGet: {{ toYaml .httpGet | indent 4 }}
   {{- else if .tcpSocket }}
   tcpSocket:
-  {{ toYaml .tcpSocket | indent 2 }}
+  {{- toYaml .tcpSocket | indent 4 }}
   {{- end }}
   {{- if .initialDelaySeconds }}
   initialDelaySeconds: {{ .initialDelaySeconds }}
