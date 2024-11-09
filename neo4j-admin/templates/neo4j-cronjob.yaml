@@ -34,9 +34,11 @@ spec:
         spec:
           {{- if .Values.serviceAccountName }}
           serviceAccountName: {{ .Values.serviceAccountName }}
+          {{- else }}
+          serviceAccountName: {{ include "neo4j.fullname" . }}
+          {{- end }}
           {{- /* explicitly mount token because some service accounts disable automount-by-default and require explicit opt-in */}}
           automountServiceAccountToken: true
-          {{- end }}
           restartPolicy: Never
           securityContext: {{ .Values.securityContext | toYaml  | nindent 12 }}
           {{- include "neo4j.tolerations" .Values.tolerations | nindent 10 }}
@@ -56,6 +58,8 @@ spec:
                   value: {{ .Values.backup.databaseNamespace | default "default"  | trim }}
                 - name: DATABASE_BACKUP_PORT
                   value: {{ .Values.backup.databaseBackupPort | default "6362" | trim | quote }}
+                - name: DATABASE_BACKUP_PORT_NAME
+                  value: {{ .Values.backup.databaseBackupPortName | default "tcp-backup" | trim | quote }}
                 - name: DATABASE_CLUSTER_DOMAIN
                   value: {{ .Values.backup.databaseClusterDomain | default "cluster.local"  | trim | quote }}
                 - name: DATABASE
@@ -65,7 +69,7 @@ spec:
                 - name: BUCKET_NAME
                   value: {{ .Values.backup.bucketName | trim }}
                 - name: KEEP_BACKUP_FILES
-                  value: "{{ .Values.backup.keepBackupFiles | default true }}"
+                  value: {{ .Values.backup.keepBackupFiles | default "true" | quote }}
                 - name: PAGE_CACHE
                   value: {{ .Values.backup.pageCache | trim }}
                 - name: HEAP_SIZE
@@ -138,6 +142,53 @@ spec:
   {{- toYaml $.Values.tempVolume | nindent 14 }}
 {{- else }}
   {{- printf "emptyDir: {}" | nindent 14 }}
+{{- end }}
+
+{{- if not .Values.serviceAccountName }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "neo4j.fullname" . }}
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service | quote }}
+    app.kubernetes.io/instance: {{ include "neo4j.fullname" . | quote }}
+    {{- include "neo4j.labels" $.Values.neo4j.labels | indent 4 }}
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "neo4j.fullname" . }}
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service | quote }}
+    app.kubernetes.io/instance: {{ include "neo4j.fullname" . | quote }}
+    {{- include "neo4j.labels" $.Values.neo4j.labels | indent 4 }}
+rules:
+- apiGroups: [""]
+  resources: ["services", "endpoints", "pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["discovery.k8s.io"]
+  resources: ["endpointslices"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "neo4j.fullname" . }}
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service | quote }}
+    app.kubernetes.io/instance: {{ include "neo4j.fullname" . | quote }}
+    {{- include "neo4j.labels" $.Values.neo4j.labels | indent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "neo4j.fullname" . }}
+subjects:
+- kind: ServiceAccount
+  name: {{ include "neo4j.fullname" . }}
+  namespace: {{ .Release.Namespace }}
 {{- end }}
 
 

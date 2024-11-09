@@ -1,0 +1,78 @@
+disableLookups: true
+neo4j:
+  jobSchedule: "0 */1 * * *"
+  image: "ryanmcafee/neo4j-helm-charts-backup"
+  imageTag: "5.25.1"
+  labels:
+    "CodeOwner": "jupiterone-tiny-hippocamp"
+    "ManagedProject": "provision-neo4j"
+    "project": "provision-neo4j"
+    
+  podLabels:
+    "CodeOwner": "jupiterone-tiny-hippocamp"
+    "ManagedProject": "provision-neo4j"
+    "project": "provision-neo4j"
+    
+backup:
+  bucketName: neo4j-backups-neo4j-pod-005-jupiterone-prod-us
+  databaseAdminServiceName: neo4j-pod-005-admin-prod-us
+  database: ""
+  cloudProvider: "aws"
+  databaseNamespace: query-engine-005
+  azureStorageAccountName: ""
+  minioEndpoint: ""
+  keepBackupFiles: "false"
+  pageCache: 8G
+  heapSize: 8G
+serviceAccountName: neo4j
+resources:
+  requests:
+    ephemeralStorage: "5Gi"
+    cpu: 2000m
+    memory: 16Gi
+  limits:
+    ephemeralStorage: "5Gi"
+    cpu: 2000m
+    memory: 16Gi
+tempVolume:
+  persistentVolumeClaim:
+    claimName: neo4j-pod-005-admin-prod-us
+consistencyCheck:
+  enabled: true
+  maxOffHeapMemory: ""
+  threads: ""
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+          - key: topology.kubernetes.io/zone
+            operator: In
+            values:
+              - "us-east-2a"
+              
+          - key: performanceprofile
+            operator: In
+            values:
+              - memory_optimized
+          - key: ec2_instance_type
+            operator: In
+            values:
+              - r7g.xlarge
+          - key: workload
+            operator: In
+            values:
+              - neo4j
+tolerations:
+  - key: performanceprofile
+    operator: Equal
+    value: memory_optimized
+    effect: NoSchedule
+  - key: ec2_instance_type
+    operator: Equal
+    value: r7g.xlarge
+    effect: NoSchedule
+  - key: workload
+    operator: Equal
+    value: neo4j
+    effect: NoSchedule

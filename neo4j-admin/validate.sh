@@ -1,0 +1,3 @@
+#!/bin/sh
+
+docker run -it --platform linux/arm64 --env=DATABASE_SERVICE_NAME=query-engine-pod-002  --env=DATABASE_CLUSTER_DOMAIN=internal.dev.jupiterone.io ryanmcafee/neo4j-helm-charts-backup:5.23.0 /var/lib/neo4j/bin/backup database backup --from=neo4j-pod-002-admin-dev.query-engine-002.svc.cluster.local:6362 --include-metadata=all --keep-failed=false --parallel-recovery=false --type=AUTO --to-path=/backups --pagecache=8G --verbose *

@@ -2,14 +2,16 @@ package main
 
 import (
 	"fmt"
+	"log"
+	"net"
+	"os"
+	"strings"
+
 	"github.com/neo4j/helm-charts/neo4j-admin/backup/aws"
 	"github.com/neo4j/helm-charts/neo4j-admin/backup/azure"
 	gcp "github.com/neo4j/helm-charts/neo4j-admin/backup/gcp"
 	neo4jAdmin "github.com/neo4j/helm-charts/neo4j-admin/backup/neo4j-admin"
 	"k8s.io/utils/strings/slices"
-	"log"
-	"os"
-	"strings"
 )
 
 func awsOperations() {
@@ -172,15 +174,46 @@ func handleError(err error) {
 	}
 }
 
-// generateAddress returns the backup address in the format <hostip:port> or <standalone-admin.default.svc.cluster.local:port>
+// generateAddress returns the backup address in the format <hostip:port> or <hostip:port,hostip:port,hostip:port...>
 func generateAddress() (string, error) {
 	if ip := os.Getenv("DATABASE_SERVICE_IP"); len(ip) > 0 {
 		address := fmt.Sprintf("%s:%s", ip, os.Getenv("DATABASE_BACKUP_PORT"))
 		log.Printf("Address := %s", address)
 		return address, nil
 	}
+
+	databaseBackupPortName := "tcp-backup"
+	databaseNamespace := os.Getenv("DATABASE_NAMESPACE")
+	databaseClusterDomain := os.Getenv("DATABASE_CLUSTER_DOMAIN")
+
+	protocol := "tcp"
 	if serviceName := os.Getenv("DATABASE_SERVICE_NAME"); len(serviceName) > 0 {
-		address := fmt.Sprintf("%s.%s.svc.%s:%s", serviceName, os.Getenv("DATABASE_NAMESPACE"), os.Getenv("DATABASE_CLUSTER_DOMAIN"), os.Getenv("DATABASE_BACKUP_PORT"))
+		// Construct SRV record name using environment variables
+		srvRecord := fmt.Sprintf("%s.%s.svc.%s", serviceName, databaseNamespace, databaseClusterDomain)
+
+		// Perform SRV lookup to get the list of endpoints for the target service
+		_, srvs, err := net.LookupSRV(databaseBackupPortName, protocol, srvRecord)
+		if err != nil {
+			return "", fmt.Errorf("failed to lookup SRV record: %v", err)
+		}
+
+		// Build comma-separated list of endpoints
+		var endpoints []string
+		for _, srv := range srvs {
+			target := strings.TrimSuffix(srv.Target, ".")
+			port := srv.Port
+
+			ips, err := net.LookupHost(target)
+			if err != nil {
+				fmt.Printf("Error resolving target %s: %v\n", target, err)
+				continue
+			}
+			for _, ip := range ips {
+				endpoints = append(endpoints, fmt.Sprintf("%s:%d", ip, port))
+			}
+		}
+
+		address := strings.Join(endpoints, ",")
 		log.Printf("Address := %s", address)
 		return address, nil
 	}
