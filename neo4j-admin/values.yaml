@@ -9,7 +9,7 @@ disableLookups: false
 
 neo4j:
   image: "neo4j/helm-charts-backup"
-  imageTag: "5.24.1"
+  imageTag: "5.25.1"
   podLabels: {}
 #    app: "demo"
 #    acac: "dcdddc"
@@ -33,7 +33,9 @@ backup:
   # bucket: azure-storage-container
   bucketName: ""
 
-  #address details of the neo4j instance from which backup is to be done (serviceName or ip either one is required)
+  # Specify multiple backup endpoints as comma-separated string
+  # e.g. "10.3.3.2:6362,10.3.3.3:6362,10.3.3.4:6362"
+  databaseBackupEndpoints: ""
 
   #ex: standalone-admin.default.svc.cluster.local:6362
   # admin service name -  standalone-admin
@@ -159,6 +161,15 @@ securityContext:
   fsGroup: 7474
   fsGroupChangePolicy: "Always"
 
+containerSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 7474
+  runAsGroup: 7474
+  readOnlyRootFilesystem: false
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+
 # default ephemeral storage of backup container
 resources:
   requests:
@@ -209,3 +220,4 @@ tolerations: []
 #    operator: "Equal"
 #    value: "value2"
 #    effect: "NoSchedule"
+

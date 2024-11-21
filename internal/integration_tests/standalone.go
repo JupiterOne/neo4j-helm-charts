@@ -12,22 +12,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	. "github.com/neo4j/helm-charts/internal/helpers"
-	"github.com/neo4j/helm-charts/internal/integration_tests/gcloud"
-	"github.com/neo4j/helm-charts/internal/model"
-	"github.com/stretchr/testify/assert"
 	"io"
-	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
-	restclient "k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 	"log"
 	"math/big"
 	"os"
@@ -38,6 +23,22 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	. "github.com/neo4j/helm-charts/internal/helpers"
+	"github.com/neo4j/helm-charts/internal/integration_tests/gcloud"
+	"github.com/neo4j/helm-charts/internal/model"
+	"github.com/stretchr/testify/assert"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	restclient "k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 )
 
 type SubTest struct {
@@ -573,6 +574,11 @@ func runSubTests(t *testing.T, subTests []SubTest) {
 }
 
 func installNeo4j(t *testing.T, releaseName model.ReleaseName, chart model.Neo4jHelmChartBuilder, extraHelmInstallArgs ...string) (Closeable, error) {
+	err := waitForClusterConnection(t)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to cluster: %v", err)
+	}
+
 	closeables := []Closeable{}
 	addCloseable := func(closeable Closeable) {
 		closeables = append([]Closeable{closeable}, closeables...)
@@ -1075,7 +1081,7 @@ func InstallReverseProxyHelmChart(t *testing.T, standaloneReleaseName model.Rele
 	assert.NotNil(t, pods, "no reverse proxy pods found")
 	assert.Equal(t, len(pods.Items), 1, "more than 1 reverse proxy pods found")
 
-	cmd := []string{"ls", "-lst", "/go"}
+	cmd := []string{"ls", "-lst", "/reverse-proxy"}
 	stdoutCmd, _, err := ExecInPod(standaloneReleaseName, cmd, pods.Items[0].Name)
 	assert.NoError(t, err, "cannot exec in reverse proxy pod")
 	assert.NotContains(t, stdoutCmd, "root")
@@ -1089,9 +1095,9 @@ func InstallReverseProxyHelmChart(t *testing.T, standaloneReleaseName model.Rele
 	assert.NotEmpty(t, ingressIP, "no ingress ip found")
 
 	ingressURL := fmt.Sprintf("https://%s:443", ingressIP)
-	stdout, _, err := RunCommand(exec.Command("curl", "-ivk", ingressURL))
+	stdout, _, err := RunCommand(exec.Command("wget", "-qO-", "--no-check-certificate", ingressURL))
 	assert.NoError(t, err)
-	assert.NotNil(t, string(stdout), "no curl output found")
+	assert.NotNil(t, string(stdout), "no wget output found")
 	assert.Contains(t, string(stdout), "bolt_routing")
 	assert.NotContains(t, string(stdout), "8443")
 
@@ -1112,6 +1118,7 @@ func createGCPServiceAccount(k8sServiceAccountName string, namespace string, gcp
 	serviceAccountConfig := fmt.Sprintf("serviceAccount:%s", serviceAccountEmail)
 	log.Printf("serviceAccountConfig %s serviceAccountEmail %s", serviceAccountConfig, serviceAccountEmail)
 	log.Printf("GCP service account creation done \n Stdout = %s \n Stderr = %s", string(stdout), string(stderr))
+	time.Sleep(10 * time.Second)
 
 	stdout, stderr, err = RunCommand(exec.Command("gcloud", "projects", "add-iam-policy-binding",
 		project, "--member", serviceAccountConfig, "--role", "roles/storage.admin"))

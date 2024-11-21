@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"strings"
 
@@ -174,50 +173,26 @@ func handleError(err error) {
 	}
 }
 
-// generateAddress returns the backup address in the format <hostip:port> or <hostip:port,hostip:port,hostip:port...>
+// generateAddress returns the backup address in the format <hostip:port> or <standalone-admin.default.svc.cluster.local:port>
 func generateAddress() (string, error) {
+	if endpoints := os.Getenv("DATABASE_BACKUP_ENDPOINTS"); len(endpoints) > 0 {
+		return endpoints, nil
+	}
+
+	// Legacy support for single endpoint
 	if ip := os.Getenv("DATABASE_SERVICE_IP"); len(ip) > 0 {
-		address := fmt.Sprintf("%s:%s", ip, os.Getenv("DATABASE_BACKUP_PORT"))
-		log.Printf("Address := %s", address)
-		return address, nil
+		return fmt.Sprintf("%s:%s", ip, os.Getenv("DATABASE_BACKUP_PORT")), nil
 	}
 
-	databaseBackupPortName := "tcp-backup"
-	databaseNamespace := os.Getenv("DATABASE_NAMESPACE")
-	databaseClusterDomain := os.Getenv("DATABASE_CLUSTER_DOMAIN")
-
-	protocol := "tcp"
 	if serviceName := os.Getenv("DATABASE_SERVICE_NAME"); len(serviceName) > 0 {
-		// Construct SRV record name using environment variables
-		srvRecord := fmt.Sprintf("%s.%s.svc.%s", serviceName, databaseNamespace, databaseClusterDomain)
-
-		// Perform SRV lookup to get the list of endpoints for the target service
-		_, srvs, err := net.LookupSRV(databaseBackupPortName, protocol, srvRecord)
-		if err != nil {
-			return "", fmt.Errorf("failed to lookup SRV record: %v", err)
-		}
-
-		// Build comma-separated list of endpoints
-		var endpoints []string
-		for _, srv := range srvs {
-			target := strings.TrimSuffix(srv.Target, ".")
-			port := srv.Port
-
-			ips, err := net.LookupHost(target)
-			if err != nil {
-				fmt.Printf("Error resolving target %s: %v\n", target, err)
-				continue
-			}
-			for _, ip := range ips {
-				endpoints = append(endpoints, fmt.Sprintf("%s:%d", ip, port))
-			}
-		}
-
-		address := strings.Join(endpoints, ",")
-		log.Printf("Address := %s", address)
-		return address, nil
+		return fmt.Sprintf("%s.%s.svc.%s:%s",
+			serviceName,
+			os.Getenv("DATABASE_NAMESPACE"),
+			os.Getenv("DATABASE_CLUSTER_DOMAIN"),
+			os.Getenv("DATABASE_BACKUP_PORT")), nil
 	}
-	return "", fmt.Errorf("cannot generate address. Invalid DATABASE_SERVICE_IP = %s or DATABASE_SERVICE_NAME = %s", os.Getenv("DATABASE_SERVICE_IP"), os.Getenv("DATABASE_SERVICE_NAME"))
+
+	return "", fmt.Errorf("no valid backup endpoints specified")
 }
 
 func deleteBackupFiles(backupFileNames, consistencyCheckReports []string) error {
