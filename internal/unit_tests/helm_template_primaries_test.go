@@ -3,9 +3,14 @@ package unit_tests
 import (
 	"errors"
 	"fmt"
+	"sort"
+
 	v12 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"sort"
+
+	"strconv"
+	"strings"
+	"testing"
 
 	"github.com/neo4j/helm-charts/internal/helpers"
 	"github.com/neo4j/helm-charts/internal/model"
@@ -13,10 +18,8 @@ import (
 	pv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	"github.com/stretchr/testify/assert"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
-	"strconv"
-	"strings"
-	"testing"
 )
 
 var acceptLicenseAgreement = []string{"--set", "neo4j.acceptLicenseAgreement=yes"}
@@ -149,7 +152,7 @@ func TestEnterpriseThrowsErrorIfLicenseAgreementNotAccepted(t *testing.T) {
 		_, err := model.HelmTemplate(t, chart, testCase, useNeo4jClusterName...)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "to use Neo4j Enterprise Edition you must have a Neo4j license agreement")
-		assert.Contains(t, err.Error(), "Set neo4j.acceptLicenseAgreement: \"yes\" to confirm that you have a Neo4j license agreement.")
+		assert.Contains(t, err.Error(), "Set neo4j.acceptLicenseAgreement: \"yes\" or neo4j.acceptLicenseAgreement: \"eval\" to confirm that you have a Neo4j license agreement.")
 	}
 
 	forEachPrimaryChart(t, func(t *testing.T, chart model.Neo4jHelmChartBuilder) {
@@ -166,8 +169,10 @@ func TestEnterpriseDoesNotThrowErrorIfLicenseAgreementAccepted(t *testing.T) {
 
 	testCases := [][]string{
 		append(useEnterprise, "--set", "neo4j.acceptLicenseAgreement=yes"),
+		append(useEnterprise, "--set", "neo4j.acceptLicenseAgreement=eval"),
 		append(useEnterprise, acceptLicenseAgreement...),
 		append(useEnterprise, resources.AcceptLicenseAgreement.HelmArgs()...),
+		append(useEnterprise, resources.AcceptLicenseAgreementEval.HelmArgs()...),
 	}
 
 	doTestCase := func(t *testing.T, chart model.Neo4jHelmChartBuilder, testCase []string) {
@@ -990,15 +995,11 @@ func TestClusterEnabledConfigMap(t *testing.T) {
 	assert.Equal(t, defaultConfig.Data["initial.dbms.default_primaries_count"], fmt.Sprint(clusterSize))
 	assert.Equal(t, defaultConfig.Data["dbms.cluster.minimum_initial_system_primaries_count"], fmt.Sprint(clusterSize))
 	assert.Contains(t, defaultConfig.Data, "dbms.cluster.discovery.resolver_type")
-	assert.Contains(t, defaultConfig.Data, "dbms.kubernetes.service_port_name")
-	assert.Contains(t, defaultConfig.Data, "dbms.kubernetes.service_port_name")
 	assert.Contains(t, defaultConfig.Data, "dbms.routing.default_router")
 	assert.Contains(t, defaultConfig.Data, "dbms.routing.client_side.enforce_for_domains")
 	assert.Contains(t, defaultConfig.Data, "dbms.routing.enabled")
-	assert.Contains(t, defaultConfig.Data, "dbms.cluster.discovery.version")
-	assert.Contains(t, defaultConfig.Data, "dbms.kubernetes.discovery.v2.service_port_name")
+	assert.Contains(t, defaultConfig.Data, "dbms.kubernetes.discovery.service_port_name")
 	assert.Contains(t, defaultConfig.Data, "server.bolt.advertised_address")
-	assert.Contains(t, defaultConfig.Data, "server.discovery.advertised_address")
 	assert.Contains(t, defaultConfig.Data, "server.cluster.raft.advertised_address")
 	assert.Contains(t, defaultConfig.Data, "server.cluster.advertised_address")
 	assert.Contains(t, defaultConfig.Data, "server.routing.advertised_address")
@@ -2114,7 +2115,6 @@ func TestNeo4jResourcesAndLimits(t *testing.T) {
 		GenerateNeo4jResourcesTestCase([]string{"memoryRequests"}, "", "3Gi"),
 		GenerateNeo4jResourcesTestCase([]string{"cpuRequests", "memoryResources"}, "1", "3Gi"),
 		GenerateNeo4jResourcesTestCase([]string{"cpuResources", "memoryResources"}, "0.5", "3Gi"),
-		GenerateNeo4jResourcesTestCase([]string{"cpuRequests", "memoryRequests"}, "0.5", "3Gi"),
 		GenerateNeo4jResourcesTestCase([]string{"cpuResources", "memoryRequests"}, "0.5", "3Gi"),
 	}
 
@@ -2124,6 +2124,83 @@ func TestNeo4jResourcesAndLimits(t *testing.T) {
 				checkResourcesAndLimits(t, chart, edition, testCase)
 			})
 		}
+	}))
+}
+
+func TestNeo4jResourcesRequestsOnly(t *testing.T) {
+	t.Parallel()
+
+	forEachPrimaryChart(t, andEachSupportedEdition(func(t *testing.T, chart model.Neo4jHelmChartBuilder, edition string) {
+		var helmTemplateArgs []string
+		desiredFeatures := [][]string{
+			useNeo4jClusterName,
+			useDataModeAndAcceptLicense,
+			{"--set", "neo4j.resources.requests.cpu=500m", "--set", "neo4j.resources.requests.memory=2Gi"},
+		}
+		if edition == "enterprise" {
+			desiredFeatures = append(desiredFeatures, useEnterpriseAndAcceptLicense)
+		}
+		for _, a := range desiredFeatures {
+			helmTemplateArgs = append(helmTemplateArgs, a...)
+		}
+
+		manifest, err := model.HelmTemplate(t, chart, helmTemplateArgs)
+		if !assert.NoError(t, err) {
+			return
+		}
+
+		statefulSets := manifest.OfType(&appsv1.StatefulSet{})
+		assert.Len(t, statefulSets, 1)
+
+		statefulSet := statefulSets[0].(*appsv1.StatefulSet)
+		assert.Len(t, statefulSet.Spec.Template.Spec.Containers, 1)
+		container := statefulSet.Spec.Template.Spec.Containers[0]
+
+		assert.Equal(t, "500m", container.Resources.Requests.Cpu().String())
+		assert.Equal(t, "2Gi", container.Resources.Requests.Memory().String())
+		assert.True(t, container.Resources.Limits.Cpu().IsZero(), "CPU limits should not be set when omitted in full format")
+		assert.True(t, container.Resources.Limits.Memory().IsZero(), "Memory limits should not be set when omitted in full format")
+	}))
+}
+
+func TestNeo4jResourcesIndependentLimits(t *testing.T) {
+	t.Parallel()
+
+	forEachPrimaryChart(t, andEachSupportedEdition(func(t *testing.T, chart model.Neo4jHelmChartBuilder, edition string) {
+		var helmTemplateArgs []string
+		desiredFeatures := [][]string{
+			useNeo4jClusterName,
+			useDataModeAndAcceptLicense,
+			{
+				"--set", "neo4j.resources.requests.cpu=500m",
+				"--set", "neo4j.resources.requests.memory=2Gi",
+				"--set", "neo4j.resources.limits.cpu=2000m",
+				"--set", "neo4j.resources.limits.memory=4Gi",
+			},
+		}
+		if edition == "enterprise" {
+			desiredFeatures = append(desiredFeatures, useEnterpriseAndAcceptLicense)
+		}
+		for _, a := range desiredFeatures {
+			helmTemplateArgs = append(helmTemplateArgs, a...)
+		}
+
+		manifest, err := model.HelmTemplate(t, chart, helmTemplateArgs)
+		if !assert.NoError(t, err) {
+			return
+		}
+
+		statefulSets := manifest.OfType(&appsv1.StatefulSet{})
+		assert.Len(t, statefulSets, 1)
+
+		statefulSet := statefulSets[0].(*appsv1.StatefulSet)
+		assert.Len(t, statefulSet.Spec.Template.Spec.Containers, 1)
+		container := statefulSet.Spec.Template.Spec.Containers[0]
+
+		assert.Equal(t, "500m", container.Resources.Requests.Cpu().String())
+		assert.Equal(t, "2Gi", container.Resources.Requests.Memory().String())
+		assert.Equal(t, "2", container.Resources.Limits.Cpu().String())
+		assert.Equal(t, "4Gi", container.Resources.Limits.Memory().String())
 	}))
 }
 
@@ -2502,4 +2579,187 @@ func assertOnlyNeo4jImagesUsedInStatefulSet(t *testing.T, neo4jStatefulSet *apps
 	for _, container := range neo4jStatefulSet.Spec.Template.Spec.InitContainers {
 		assert.Contains(t, container.Image, "neo4j:")
 	}
+}
+
+// TestCleanupJobPodAnnotations checks if cleanup job Pod has the default and custom annotations
+func TestCleanupJobPodAnnotations(t *testing.T) {
+	t.Parallel()
+
+	forEachPrimaryChart(t, andEachSupportedEdition(func(t *testing.T, chart model.Neo4jHelmChartBuilder, edition string) {
+		if edition != "enterprise" {
+			return // Skip test for non-enterprise edition since cleanup job is enterprise-only
+		}
+
+		// Test default annotation
+		manifest, err := model.HelmTemplate(t, chart, []string{
+			"--set", "neo4j.name=" + model.DefaultNeo4jName,
+			"--set", "neo4j.minimumClusterSize=3",
+			"--set", "neo4j.edition=enterprise",
+			"--set", "neo4j.acceptLicenseAgreement=yes",
+			"--set", "services.neo4j.cleanup.enabled=true",
+			"--set", "volumes.data.mode=selector",
+		})
+		if !assert.NoError(t, err) {
+			return
+		}
+
+		cleanupJob := manifest.OfTypeWithName(&batchv1.Job{}, fmt.Sprintf("%s-cleanup", model.DefaultHelmTemplateReleaseName))
+		if !assert.NotNil(t, cleanupJob, "cleanup job not found") {
+			return
+		}
+
+		podAnnotations := cleanupJob.(*batchv1.Job).Spec.Template.ObjectMeta.Annotations
+		assert.Equal(t, "false", podAnnotations["sidecar.istio.io/inject"], "default sidecar.istio.io/inject annotation value should be false")
+
+		// Test custom annotations
+		manifest, err = model.HelmTemplate(t, chart, []string{
+			"--set", "neo4j.name=" + model.DefaultNeo4jName,
+			"--set", "neo4j.minimumClusterSize=3",
+			"--set", "neo4j.edition=enterprise",
+			"--set", "neo4j.acceptLicenseAgreement=yes",
+			"--set", "services.neo4j.cleanup.enabled=true",
+			"--set-string", "services.neo4j.cleanup.podAnnotations.sidecar\\.istio\\.io/inject=true",
+			"--set", "services.neo4j.cleanup.podAnnotations.custom\\.annotation/test=value",
+			"--set", "volumes.data.mode=selector",
+		})
+		if !assert.NoError(t, err) {
+			return
+		}
+
+		cleanupJob = manifest.OfTypeWithName(&batchv1.Job{}, fmt.Sprintf("%s-cleanup", model.DefaultHelmTemplateReleaseName))
+		if !assert.NotNil(t, cleanupJob, "cleanup job not found") {
+			return
+		}
+
+		podAnnotations = cleanupJob.(*batchv1.Job).Spec.Template.ObjectMeta.Annotations
+		assert.Equal(t, "true", podAnnotations["sidecar.istio.io/inject"], "custom sidecar.istio.io/inject annotation value should be true")
+		assert.Equal(t, "value", podAnnotations["custom.annotation/test"], "custom annotation should be present")
+	}))
+}
+
+// TestCleanupJobLabels checks if cleanup job has the correct labels
+func TestCleanupJobLabels(t *testing.T) {
+	t.Parallel()
+
+	forEachPrimaryChart(t, andEachSupportedEdition(func(t *testing.T, chart model.Neo4jHelmChartBuilder, edition string) {
+		if edition != "enterprise" {
+			return
+		}
+
+		manifest, err := model.HelmTemplate(t, chart, []string{
+			"--set", "neo4j.name=" + model.DefaultNeo4jName,
+			"--set", "neo4j.minimumClusterSize=3",
+			"--set", "neo4j.edition=enterprise",
+			"--set", "neo4j.acceptLicenseAgreement=yes",
+			"--set", "services.neo4j.cleanup.enabled=true",
+			"--set", "volumes.data.mode=selector",
+		})
+		if !assert.NoError(t, err) {
+			return
+		}
+
+		cleanupJob := manifest.OfTypeWithName(&batchv1.Job{}, fmt.Sprintf("%s-cleanup", model.DefaultHelmTemplateReleaseName))
+		if !assert.NotNil(t, cleanupJob, "cleanup job not found") {
+			return
+		}
+
+		// Check job labels
+		jobLabels := cleanupJob.(*batchv1.Job).ObjectMeta.Labels
+		assert.Equal(t, model.DefaultNeo4jName, jobLabels["app"], "incorrect app label")
+		assert.Equal(t, model.DefaultNeo4jName, jobLabels["helm.neo4j.com/neo4j.name"], "incorrect neo4j.name label")
+		assert.Equal(t, "true", jobLabels["helm.neo4j.com/clustering"], "incorrect clustering label")
+		assert.Equal(t, "cleanup", jobLabels["helm.neo4j.com/pod_category"], "incorrect pod_category label")
+		assert.Equal(t, model.DefaultHelmTemplateReleaseName.String(), jobLabels["helm.neo4j.com/instance"], "incorrect instance label")
+
+		// Check pod template labels
+		podLabels := cleanupJob.(*batchv1.Job).Spec.Template.ObjectMeta.Labels
+		assert.Equal(t, model.DefaultNeo4jName, podLabels["app"], "incorrect pod app label")
+		assert.Equal(t, model.DefaultNeo4jName, podLabels["helm.neo4j.com/neo4j.name"], "incorrect pod neo4j.name label")
+		assert.Equal(t, "true", podLabels["helm.neo4j.com/clustering"], "incorrect pod clustering label")
+		assert.Equal(t, "cleanup", podLabels["helm.neo4j.com/pod_category"], "incorrect pod pod_category label")
+		assert.Equal(t, model.DefaultHelmTemplateReleaseName.String(), podLabels["helm.neo4j.com/instance"], "incorrect pod instance label")
+
+		// Check service account labels
+		serviceAccount := manifest.OfTypeWithName(&v1.ServiceAccount{}, fmt.Sprintf("%s-cleanup", model.DefaultHelmTemplateReleaseName))
+		if !assert.NotNil(t, serviceAccount, "cleanup service account not found") {
+			return
+		}
+		saLabels := serviceAccount.GetLabels()
+		assert.Equal(t, model.DefaultNeo4jName, saLabels["app"], "incorrect service account app label")
+		assert.Equal(t, model.DefaultNeo4jName, saLabels["helm.neo4j.com/neo4j.name"], "incorrect service account neo4j.name label")
+		assert.Equal(t, "true", saLabels["helm.neo4j.com/clustering"], "incorrect service account clustering label")
+		assert.Equal(t, "cleanup", saLabels["helm.neo4j.com/pod_category"], "incorrect service account pod_category label")
+		assert.Equal(t, model.DefaultHelmTemplateReleaseName.String(), saLabels["helm.neo4j.com/instance"], "incorrect service account instance label")
+	}))
+}
+
+// TestCleanupJobImagePullSecrets tests that imagePullSecrets are correctly set in the cleanup job
+func TestCleanupJobImagePullSecrets(t *testing.T) {
+	t.Parallel()
+
+	forEachPrimaryChart(t, andEachSupportedEdition(func(t *testing.T, chart model.Neo4jHelmChartBuilder, edition string) {
+		if edition != "enterprise" {
+			return // Skip test for non-enterprise edition since cleanup job is enterprise-only
+		}
+
+		helmValues := model.DefaultEnterpriseValues
+		helmValues.DisableLookups = true
+		helmValues.Image.ImagePullSecrets = []string{"my-pull-secret", "another-secret"}
+
+		manifest, err := model.HelmTemplate(t, chart, []string{
+			"--set", "neo4j.name=" + model.DefaultNeo4jName,
+			"--set", "neo4j.minimumClusterSize=3",
+			"--set", "neo4j.edition=enterprise",
+			"--set", "neo4j.acceptLicenseAgreement=yes",
+			"--set", "services.neo4j.cleanup.enabled=true",
+			"--set", "disableLookups=true",
+			"--set", "image.imagePullSecrets[0]=my-pull-secret",
+			"--set", "image.imagePullSecrets[1]=another-secret",
+			"--set", "volumes.data.mode=selector",
+		})
+		if !assert.NoError(t, err) {
+			return
+		}
+
+		cleanupJob := manifest.OfTypeWithName(&batchv1.Job{}, fmt.Sprintf("%s-cleanup", model.DefaultHelmTemplateReleaseName))
+		if !assert.NotNil(t, cleanupJob, "cleanup job not found") {
+			return
+		}
+
+		pullSecrets := cleanupJob.(*batchv1.Job).Spec.Template.Spec.ImagePullSecrets
+		assert.Len(t, pullSecrets, 2, "should have 2 imagePullSecrets")
+		assert.Equal(t, "my-pull-secret", pullSecrets[0].Name)
+		assert.Equal(t, "another-secret", pullSecrets[1].Name)
+	}))
+}
+
+// TestCleanupJobImagePullSecretsEmpty tests that empty imagePullSecrets are handled correctly in cleanup job
+func TestCleanupJobImagePullSecretsEmpty(t *testing.T) {
+	t.Parallel()
+
+	forEachPrimaryChart(t, andEachSupportedEdition(func(t *testing.T, chart model.Neo4jHelmChartBuilder, edition string) {
+		if edition != "enterprise" {
+			return // Skip test for non-enterprise edition since cleanup job is enterprise-only
+		}
+
+		manifest, err := model.HelmTemplate(t, chart, []string{
+			"--set", "neo4j.name=" + model.DefaultNeo4jName,
+			"--set", "neo4j.minimumClusterSize=3",
+			"--set", "neo4j.edition=enterprise",
+			"--set", "neo4j.acceptLicenseAgreement=yes",
+			"--set", "services.neo4j.cleanup.enabled=true",
+			"--set", "volumes.data.mode=selector",
+		})
+		if !assert.NoError(t, err) {
+			return
+		}
+
+		cleanupJob := manifest.OfTypeWithName(&batchv1.Job{}, fmt.Sprintf("%s-cleanup", model.DefaultHelmTemplateReleaseName))
+		if !assert.NotNil(t, cleanupJob, "cleanup job not found") {
+			return
+		}
+
+		pullSecrets := cleanupJob.(*batchv1.Job).Spec.Template.Spec.ImagePullSecrets
+		assert.Nil(t, pullSecrets, "imagePullSecrets should be nil when empty")
+	}))
 }

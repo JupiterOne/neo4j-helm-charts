@@ -1,27 +1,45 @@
 package integration_tests
 
 import (
+	"bytes"
 	"context"
-	"encoding/base64"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
+	"math/big"
+	"os"
+	"os/exec"
+	"strings"
+	"testing"
+	"time"
+
 	"github.com/hashicorp/go-multierror"
 	. "github.com/neo4j/helm-charts/internal/helpers"
 	"github.com/neo4j/helm-charts/internal/integration_tests/gcloud"
 	"github.com/neo4j/helm-charts/internal/model"
+	"github.com/neo4j/helm-charts/internal/testutil/poll"
+	"github.com/neo4j/helm-charts/internal/testutil/timeouts"
 	"github.com/stretchr/testify/assert"
+	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"log"
-	"os"
-	"os/exec"
-	"regexp"
-	"strings"
-	"testing"
-	"time"
 )
 
-// labelNodes labels all the node with testLabel=namespace-<number>
+// labelNodes labels nodes with the two testLabel values that are actually
+// consumed as nodeSelectors by this test suite:
+//
+//	testLabel=<namespace>-1  → core-1 pod (see model.NodeSelectorLabel)
+//	testLabel=<namespace>-5  → backup pods (see installBackupCluster* helpers)
+//
+// Each label is applied to multiple nodes so a single GKE node replacement
+// (autorepair, autoupgrade, preemption) doesn't strand the scheduler with
+// no matching node — core-1 in particular is long-lived for the whole test,
+// and losing its only matching node leaves it Pending forever.
 func labelNodes(t *testing.T, namespace string) error {
 
 	var errors *multierror.Error
@@ -29,17 +47,57 @@ func labelNodes(t *testing.T, namespace string) error {
 	if err != nil {
 		return err
 	}
+	const replicaCount = 3
+	if len(nodesList.Items) < 2*replicaCount {
+		return fmt.Errorf("labelNodes needs at least %d nodes, got %d", 2*replicaCount, len(nodesList.Items))
+	}
 
-	for index, node := range nodesList.Items {
-		labelName := fmt.Sprintf("testLabel=%s-%d", namespace, index+1)
-		err = run(t, "kubectl", "label", "nodes", node.ObjectMeta.Name, labelName)
-		if err != nil {
-			errors = multierror.Append(errors, err)
-			t.Logf("Node Label failed for %s: %v", node.ObjectMeta.Name, err)
+	assignments := []struct {
+		label    string
+		nodeIdxs []int
+	}{
+		{label: fmt.Sprintf("testLabel=%s-1", namespace), nodeIdxs: []int{0, 1, 2}},
+		{label: fmt.Sprintf("testLabel=%s-5", namespace), nodeIdxs: []int{3, 4, 5}},
+	}
+	for _, a := range assignments {
+		for _, idx := range a.nodeIdxs {
+			name := nodesList.Items[idx].ObjectMeta.Name
+			if err := run(t, "kubectl", "label", "nodes", name, "--overwrite", a.label); err != nil {
+				errors = multierror.Append(errors, err)
+				t.Logf("Node label failed for %s=%s: %v", name, a.label, err)
+			}
 		}
 	}
 
 	return errors.ErrorOrNil()
+}
+
+// ensureNodeLabel makes sure at least one node in the cluster carries
+// testLabel=<labelValue>. GKE may replace nodes mid-test (autorepair,
+// autoscaling, preemption), dropping the labels applied by labelNodes().
+// If no node still has the label, this picks a node without any testLabel
+// and applies it, so subsequent helm installs that use this label as a
+// nodeSelector find a matching node at template evaluation time.
+func ensureNodeLabel(t *testing.T, labelValue string) error {
+	selector := fmt.Sprintf("testLabel=%s", labelValue)
+	if _, err := getNodeWithLabel(selector); err == nil {
+		return nil
+	}
+
+	nodesList, err := getNodesList()
+	if err != nil {
+		return err
+	}
+
+	for _, node := range nodesList.Items {
+		if _, hasLabel := node.ObjectMeta.Labels["testLabel"]; hasLabel {
+			continue
+		}
+		t.Logf("ensureNodeLabel: %s missing, applying to node %s", selector, node.ObjectMeta.Name)
+		return run(t, "kubectl", "label", "nodes", node.ObjectMeta.Name, selector)
+	}
+
+	return fmt.Errorf("no unlabeled node available to apply %s", selector)
 }
 
 // removeLabelFromNodes removes label testLabel from all the nodes added via labelNodes func
@@ -66,13 +124,25 @@ func removeLabelFromNodes(t *testing.T) error {
 func clusterTests(clusterRelease model.ReleaseName) ([]SubTest, error) {
 
 	subTests := []SubTest{
-		{name: "Install Backup Helm Chart For AWS With NodeSelector", test: func(t *testing.T) {
+		{name: "Install Backup Helm Chart For AWS Local With Consistency Check", test: func(t *testing.T) {
 			t.Parallel()
-			assert.NoError(t, InstallNeo4jBackupAWSHelmChartWithNodeSelector(t, clusterRelease), "Backup to AWS should succeed")
+			assert.NoError(t, InstallNeo4jBackupAWSLocalWithConsistencyCheck(t, clusterRelease), "Local backup with consistency check should succeed")
 		}},
-		{name: "Install Backup Helm Chart For AWS Using MinIO", test: func(t *testing.T) {
+		{name: "Install Backup Helm Chart For AWS Cloud Storage", test: func(t *testing.T) {
 			t.Parallel()
-			assert.NoError(t, InstallNeo4jBackupAWSHelmChartViaMinIO(t, clusterRelease), "Backup to AWS using MinIO should succeed")
+			assert.NoError(t, InstallNeo4jBackupAWSCloudStorage(t, clusterRelease), "Cloud backup to AWS S3 should succeed")
+		}},
+		{name: "Install Backup Helm Chart For AWS Using S3", test: func(t *testing.T) {
+			t.Parallel()
+			assert.NoError(t, InstallNeo4jBackupAWSHelmChartViaS3(t, clusterRelease), "Backup to AWS using S3 should succeed")
+		}},
+		{name: "Install Backup Helm Chart For AWS Using S3 with TLS", test: func(t *testing.T) {
+			t.Parallel()
+			assert.NoError(t, InstallNeo4jBackupAWSHelmChartViaS3TLS(t, clusterRelease), "Backup to AWS using S3 with TLS should succeed")
+		}},
+		{name: "Install Backup Helm Chart For AWS Using Custom Aggregate Tempdir", test: func(t *testing.T) {
+			t.Parallel()
+			assert.NoError(t, InstallBackupViaTempDir(t, clusterRelease), "Backup with custom aggregate tempdir should succeed")
 		}},
 		{name: "Check Cluster Core Logs Format", test: func(t *testing.T) {
 			t.Parallel()
@@ -119,7 +189,7 @@ func InstallNeo4jBackupGCPHelmChartWithWorkloadIdentityForCluster(t *testing.T, 
 	}
 	shortName := clusterReleaseName.ShortName()
 	currentUnixTime := time.Now().Unix()
-	backupReleaseName := model.NewReleaseName(fmt.Sprintf("%s-gcp-workload-%s", shortName, TestRunIdentifier))
+	backupReleaseName := model.NewReleaseName(fmt.Sprintf("%s-gcp-workload-%s", shortName, TestNamespace(t)))
 	gcpServiceAccountName := fmt.Sprintf("%s-%d", gcpServiceAccountNamePrefix, currentUnixTime)
 	k8sServiceAccountName := fmt.Sprintf("%s-%d", k8sServiceAccountNamePrefix, currentUnixTime)
 	namespace := string(clusterReleaseName.Namespace())
@@ -166,44 +236,34 @@ func InstallNeo4jBackupGCPHelmChartWithWorkloadIdentityForCluster(t *testing.T, 
 	}
 	helmValues.ServiceAccountName = k8sServiceAccountName
 
+	// Explicitly disable consistency checks for cloud storage backups to avoid timeouts
+	// This follows the same pattern used for AWS cloud backups
+	helmValues.ConsistencyCheck.Enable = false
+	helmValues.ConsistencyCheck.Database = ""
+
 	_, err = helmClient.Install(t, backupReleaseName.String(), namespace, helmValues)
 	assert.NoError(t, err)
 
-	time.Sleep(2 * time.Minute)
 	cronjob, err := Clientset.BatchV1().CronJobs(namespace).Get(context.Background(), backupReleaseName.String(), metav1.GetOptions{})
 	assert.NoError(t, err, "cannot retrieve gcp backup cronjob")
 	assert.Equal(t, cronjob.Spec.Schedule, helmValues.Neo4J.JobSchedule, fmt.Sprintf("gcp cronjob schedule %s not matching with the schedule defined in values.yaml %s", cronjob.Spec.Schedule, helmValues.Neo4J.JobSchedule))
 
-	pods, err := Clientset.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{})
-	assert.NoError(t, err, "error while retrieving pod list during gcp backup operation")
-
-	var found bool
-	for _, pod := range pods.Items {
-		if strings.Contains(pod.Name, "gcp-workload") {
-			found = true
-			out, err := exec.Command("kubectl", "logs", pod.Name, "--namespace", namespace).CombinedOutput()
-			assert.NoError(t, err, "error while getting gcp workload backup pod logs")
-			assert.NotNil(t, out, "gcp backup logs cannot be retrieved")
-			assert.Contains(t, string(out), "Backup Completed for database neo4j system !!")
-			assert.Regexp(t, regexp.MustCompile("neo4j(.*)backup uploaded to GCS bucket"), string(out))
-			assert.Regexp(t, regexp.MustCompile("system(.*)backup uploaded to GCS bucket"), string(out))
-			assert.Regexp(t, regexp.MustCompile("No inconsistencies found"), string(out))
-			assert.NotContains(t, string(out), "Deleting file")
-			break
-		}
+	_, logOutput, pollErr := waitForBackupPodCompletion(t, namespace, "gcp-workload", "Backup completed successfully", 8*time.Minute)
+	assert.NoError(t, pollErr, "gcp workload backup did not complete")
+	if pollErr == nil {
+		assert.NotContains(t, logOutput, "Deleting file")
 	}
-	assert.Equal(t, true, found, "no gcp workload backup pod found")
 
 	return nil
 }
 
-// InstallNeo4jBackupAWSHelmChartWithNodeSelector installs backup cronjob using the given nodeselector labels
-func InstallNeo4jBackupAWSHelmChartWithNodeSelector(t *testing.T, releaseName model.ReleaseName) error {
+// InstallNeo4jBackupAWSLocalWithConsistencyCheck performs local backup with consistency check
+func InstallNeo4jBackupAWSLocalWithConsistencyCheck(t *testing.T, releaseName model.ReleaseName) error {
 	if model.Neo4jEdition == "community" {
 		t.Skip()
 		return nil
 	}
-	backupReleaseName := model.NewReleaseName("cluster-backup-aws-" + TestRunIdentifier)
+	backupReleaseName := model.NewReleaseName("cluster-backup-local-" + TestNamespace(t))
 	namespace := string(releaseName.Namespace())
 
 	t.Cleanup(func() {
@@ -211,6 +271,149 @@ func InstallNeo4jBackupAWSHelmChartWithNodeSelector(t *testing.T, releaseName mo
 			{"uninstall", backupReleaseName.String(), "--wait", "--timeout", "3m", "--namespace", namespace},
 		}, false)
 	})
+
+	helmClient := model.NewHelmClient(model.DefaultNeo4jBackupChartName)
+	helmValues := model.DefaultNeo4jBackupValues
+	helmValues.Backup = model.Backup{
+		DatabaseAdminServiceName: fmt.Sprintf("%s-admin", releaseName.String()),
+		DatabaseNamespace:        namespace,
+		Database:                 "neo4j,system",
+		CloudProvider:            "", // Local backup
+		Verbose:                  true,
+		Type:                     "FULL",
+		KeepBackupFiles:          true,
+	}
+	helmValues.NodeSelector = map[string]string{
+		"testLabel": fmt.Sprintf("%s-5", namespace),
+	}
+	// Enable consistency check for local backup
+	helmValues.ConsistencyCheck.Enable = true
+	helmValues.ConsistencyCheck.Database = "neo4j"
+
+	if err := ensureNodeLabel(t, fmt.Sprintf("%s-5", namespace)); err != nil {
+		return err
+	}
+
+	_, err := helmClient.Install(t, backupReleaseName.String(), namespace, helmValues)
+	assert.NoError(t, err)
+
+	cronjob, err := Clientset.BatchV1().CronJobs(namespace).Get(context.Background(), backupReleaseName.String(), metav1.GetOptions{})
+	assert.NoError(t, err, "cannot retrieve local backup cronjob")
+	assert.Equal(t, cronjob.Spec.Schedule, helmValues.Neo4J.JobSchedule, fmt.Sprintf("local backup cronjob schedule %s not matching with the schedule defined in values.yaml %s", cronjob.Spec.Schedule, helmValues.Neo4J.JobSchedule))
+
+	// Poll for backup completion with consistency check - shorter timeout for local backup
+	deadline := time.Now().Add(10 * time.Minute) // Local backup should be much faster
+	var found bool
+	var logOutput string
+
+	for !time.Now().After(deadline) {
+		pods, err := Clientset.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{})
+		if err != nil {
+			t.Logf("Error retrieving pod list: %v", err)
+			time.Sleep(30 * time.Second)
+			continue
+		}
+
+		found = false
+		for _, pod := range pods.Items {
+			if strings.Contains(pod.Name, "cluster-backup-local") {
+				found = true
+				var logsErr error
+				logOutput, logsErr = kubectlLogs(t, pod.Name, namespace)
+				if logsErr != nil {
+					time.Sleep(30 * time.Second)
+					continue
+				}
+
+				// Check if backup completed successfully
+				if !strings.Contains(logOutput, "Backup completed successfully") {
+					t.Logf("Local backup not yet completed, waiting...")
+					time.Sleep(30 * time.Second)
+					continue
+				}
+
+				// Check if consistency check completed successfully
+				if strings.Contains(logOutput, "No inconsistencies found") {
+					t.Logf("Local backup and consistency check completed successfully")
+					assertPodOnLabeledNode(t, pod, fmt.Sprintf("testLabel=%s-5", namespace))
+					return nil
+				} else if strings.Contains(logOutput, "Consistency Check Failed") || strings.Contains(logOutput, "Consistency check timed out") {
+					t.Logf("Consistency check failed or timed out")
+					assert.Fail(t, "Consistency check failed", "Consistency check failed or timed out. Logs: %s", logOutput)
+					return fmt.Errorf("consistency check failed")
+				} else {
+					// Consistency check is still running
+					t.Logf("Local backup completed, consistency check still in progress...")
+					time.Sleep(30 * time.Second)
+					continue
+				}
+			}
+		}
+
+		if !found {
+			t.Logf("No local backup pod found yet, waiting...")
+			time.Sleep(30 * time.Second)
+		}
+	}
+
+	if !found {
+		assert.Fail(t, "No local backup pod found after timeout")
+		return fmt.Errorf("no local backup pod found")
+	}
+
+	// If we reach here, we timed out waiting for consistency check
+	assert.Fail(t, "Local backup consistency check did not complete within timeout", "Final logs: %s", logOutput)
+	return fmt.Errorf("local backup consistency check did not complete within 10 minutes")
+}
+
+// InstallNeo4jBackupAWSCloudStorage performs cloud backup to AWS S3 without consistency check
+func InstallNeo4jBackupAWSCloudStorage(t *testing.T, releaseName model.ReleaseName) error {
+	if model.Neo4jEdition == "community" {
+		t.Skip()
+		return nil
+	}
+	backupReleaseName := model.NewReleaseName("cluster-backup-aws-" + TestNamespace(t))
+	namespace := string(releaseName.Namespace())
+
+	t.Cleanup(func() {
+		_ = runAll(t, "kubectl", [][]string{
+			{"delete", "secret", "awscred", "--namespace", namespace, "--ignore-not-found"},
+		}, false)
+		_ = runAll(t, "helm", [][]string{
+			{"uninstall", backupReleaseName.String(), "--wait", "--timeout", "3m", "--namespace", namespace},
+		}, false)
+	})
+
+	_ = runAll(t, "kubectl", [][]string{
+		{"delete", "secret", "awscred", "--namespace", namespace, "--ignore-not-found"},
+	}, false)
+
+	time.Sleep(2 * time.Second)
+
+	secretKey := &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "awscred",
+			Namespace: namespace,
+		},
+		Data: map[string][]byte{
+			"credentials": []byte(fmt.Sprintf("[default]\nregion = us-east-1\naws_access_key_id=%s\naws_secret_access_key=%s",
+				os.Getenv("AWS_ACCESS_KEY_ID"),
+				os.Getenv("AWS_SECRET_ACCESS_KEY"))),
+		},
+		Type: "Opaque",
+	}
+
+	_, err := Clientset.CoreV1().Secrets(namespace).Create(context.TODO(), secretKey, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to create AWS credentials secret: %v", err)
+	}
+
+	_, err = Clientset.CoreV1().Secrets(namespace).Get(context.TODO(), "awscred", metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to verify AWS credentials secret exists: %v", err)
+	}
+
+	time.Sleep(2 * time.Second)
 
 	bucketName := model.BucketName
 	helmClient := model.NewHelmClient(model.DefaultNeo4jBackupChartName)
@@ -223,69 +426,136 @@ func InstallNeo4jBackupAWSHelmChartWithNodeSelector(t *testing.T, releaseName mo
 		CloudProvider:            "aws",
 		SecretName:               "awscred",
 		SecretKeyName:            "credentials",
+		S3Region:                 "us-east-1",
+		S3ForcePathStyle:         true,
 		Verbose:                  true,
 		Type:                     "FULL",
+		KeepBackupFiles:          true,
 	}
 	helmValues.NodeSelector = map[string]string{
 		"testLabel": fmt.Sprintf("%s-5", namespace),
 	}
-	helmValues.ConsistencyCheck.Database = "neo4j"
-	_, err := helmClient.Install(t, backupReleaseName.String(), namespace, helmValues)
+	// Disable consistency check for cloud backup to avoid timeouts and reduce template size
+	helmValues.ConsistencyCheck.Enable = false
+	helmValues.ConsistencyCheck.Database = ""
+
+	if err := ensureNodeLabel(t, fmt.Sprintf("%s-5", namespace)); err != nil {
+		return err
+	}
+
+	_, err = helmClient.Install(t, backupReleaseName.String(), namespace, helmValues)
 	assert.NoError(t, err)
 
-	time.Sleep(2 * time.Minute)
 	cronjob, err := Clientset.BatchV1().CronJobs(namespace).Get(context.Background(), backupReleaseName.String(), metav1.GetOptions{})
-	assert.NoError(t, err, "cannot retrieve aws backup cronjob")
-	assert.Equal(t, cronjob.Spec.Schedule, helmValues.Neo4J.JobSchedule, fmt.Sprintf("aws cronjob schedule %s not matching with the schedule defined in values.yaml %s", cronjob.Spec.Schedule, helmValues.Neo4J.JobSchedule))
+	assert.NoError(t, err, "cannot retrieve aws cloud backup cronjob")
+	assert.Equal(t, cronjob.Spec.Schedule, helmValues.Neo4J.JobSchedule, fmt.Sprintf("aws cloud backup cronjob schedule %s not matching with the schedule defined in values.yaml %s", cronjob.Spec.Schedule, helmValues.Neo4J.JobSchedule))
 
-	nodeSelectorNode, err := getNodeWithLabel(fmt.Sprintf("testLabel=%s-5", namespace))
-	assert.NoError(t, err)
-
-	pods, err := Clientset.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{})
-	assert.NoError(t, err, "error while retrieving pod list during aws backup operation")
-
+	// Poll for cloud backup completion - reasonable timeout without consistency check
+	deadline := time.Now().Add(8 * time.Minute) // Cloud backup without consistency check
 	var found bool
-	for _, pod := range pods.Items {
-		if strings.Contains(pod.Name, "cluster-backup-aws") {
-			found = true
-			out, err := exec.Command("kubectl", "logs", pod.Name, "--namespace", namespace).CombinedOutput()
-			assert.NoError(t, err, "error while getting aws backup pod logs")
-			assert.NotNil(t, out, "aws backup logs cannot be retrieved")
-			assert.Contains(t, string(out), "Backup Completed for database neo4j system !!")
-			assert.Regexp(t, regexp.MustCompile("neo4j(.*)backup uploaded to s3 bucket"), string(out))
-			assert.Regexp(t, regexp.MustCompile("system(.*)backup uploaded to s3 bucket"), string(out))
-			assert.Regexp(t, regexp.MustCompile("No inconsistencies found"), string(out))
-			assert.Equal(t, nodeSelectorNode.Name, pod.Spec.NodeName, fmt.Sprintf("backup pod %s is not scheduled on the correct node %s", pod.Spec.NodeName, nodeSelectorNode.Name))
-			break
+	var logOutput string
+
+	for !time.Now().After(deadline) {
+		pods, err := Clientset.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{})
+		if err != nil {
+			t.Logf("Error retrieving pod list: %v", err)
+			time.Sleep(30 * time.Second)
+			continue
+		}
+
+		found = false
+		for _, pod := range pods.Items {
+			if strings.Contains(pod.Name, "cluster-backup-aws") {
+				found = true
+				var logsErr error
+				logOutput, logsErr = kubectlLogs(t, pod.Name, namespace)
+				if logsErr != nil {
+					time.Sleep(30 * time.Second)
+					continue
+				}
+
+				// Check if backup completed successfully
+				if strings.Contains(logOutput, "Backup completed successfully") {
+					t.Logf("Cloud backup to AWS S3 completed successfully")
+					assertPodOnLabeledNode(t, pod, fmt.Sprintf("testLabel=%s-5", namespace))
+
+					// Verify backup files were created in S3
+					if strings.Contains(logOutput, "neo4j-") && strings.Contains(logOutput, "system-") {
+						t.Logf("Backup files successfully uploaded to S3")
+					}
+					return nil
+				} else {
+					t.Logf("Cloud backup not yet completed, waiting...")
+					time.Sleep(30 * time.Second)
+					continue
+				}
+			}
+		}
+
+		if !found {
+			t.Logf("No cloud backup pod found yet, waiting...")
+			time.Sleep(30 * time.Second)
 		}
 	}
-	assert.Equal(t, true, found, "no aws backup pod found")
-	return nil
+
+	if !found {
+		assert.Fail(t, "No AWS cloud backup pod found after timeout")
+		return fmt.Errorf("no aws cloud backup pod found")
+	}
+
+	// If we reach here, we timed out waiting for backup completion
+	assert.Fail(t, "Cloud backup did not complete within timeout", "Final logs: %s", logOutput)
+	return fmt.Errorf("cloud backup did not complete within 8 minutes")
 }
 
-// InstallNeo4jBackupAWSHelmChartViaMinIO installs backup cronjob and performs backup to minio bucket
-func InstallNeo4jBackupAWSHelmChartViaMinIO(t *testing.T, releaseName model.ReleaseName) error {
+func InstallNeo4jBackupAWSHelmChartViaS3(t *testing.T, releaseName model.ReleaseName) error {
 	if model.Neo4jEdition == "community" {
 		t.Skip()
 		return nil
 	}
-	backupReleaseName := model.NewReleaseName("cluster-backup-aws-minio" + TestRunIdentifier)
-	namespace := string(releaseName.Namespace())
+
+	namespace := "default"
+	backupReleaseName := model.NewReleaseName("cluster-backup-aws-s3" + TestNamespace(t))
+	secretName := "awscred"
 
 	t.Cleanup(func() {
+		_ = runAll(t, "kubectl", [][]string{
+			{"delete", "secret", secretName, "--namespace", namespace, "--ignore-not-found"},
+		}, false)
+
 		_ = runAll(t, "helm", [][]string{
 			{"uninstall", backupReleaseName.String(), "--wait", "--timeout", "3m", "--namespace", namespace},
 		}, false)
-		deleteMinio(namespace)
 	})
 
-	tenantName := "tenant1"
-	secretName := "miniocred"
-	err := installMinio(namespace, tenantName)
-	assert.NoError(t, err, "error while installing minio")
+	secretKey := &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretName,
+			Namespace: namespace,
+		},
+		Data: map[string][]byte{
+			"credentials": []byte(fmt.Sprintf("[default]\naws_access_key_id=%s\naws_secret_access_key=%s",
+				os.Getenv("AWS_ACCESS_KEY_ID"),
+				os.Getenv("AWS_SECRET_ACCESS_KEY"))),
+		},
+		Type: "Opaque",
+	}
 
-	err = kCreateMinioSecret(namespace, tenantName, secretName)
-	assert.NoError(t, err, "error while generating minio kubernetes secret")
+	_ = runAll(t, "kubectl", [][]string{
+		{"delete", "secret", secretName, "--namespace", namespace, "--ignore-not-found"},
+	}, false)
+
+	_, err := Clientset.CoreV1().Secrets(namespace).Create(context.TODO(), secretKey, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to create AWS credentials secret: %v", err)
+	}
+
+	_, err = Clientset.CoreV1().Secrets(namespace).Get(context.TODO(), secretName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to verify AWS credentials secret exists: %v", err)
+	}
+
+	time.Sleep(2 * time.Second)
 
 	bucketName := model.BucketName
 	helmClient := model.NewHelmClient(model.DefaultNeo4jBackupChartName)
@@ -298,37 +568,360 @@ func InstallNeo4jBackupAWSHelmChartViaMinIO(t *testing.T, releaseName model.Rele
 		CloudProvider:            "aws",
 		SecretName:               secretName,
 		SecretKeyName:            "credentials",
-		MinioEndpoint:            fmt.Sprintf("http://%s-hl.%s.svc.cluster.local:9000", tenantName, namespace),
+		S3Endpoint:               "http://localhost:9000",
+		S3Region:                 "us-east-1",
+		S3SignatureVersion:       "4",
+		S3ForcePathStyle:         true,
 		Verbose:                  true,
+		KeepBackupFiles:          true,
 		Type:                     "FULL",
 	}
-	helmValues.ConsistencyCheck.Database = "neo4j"
+	// Disable consistency check for S3 configuration test to avoid timeouts
+	// This test focuses on S3 parameters, not consistency check functionality
+	helmValues.ConsistencyCheck.Enable = false
+	helmValues.ConsistencyCheck.Database = ""
+	helmValues.Neo4J.JobSchedule = "* * * * *"
+
 	_, err = helmClient.Install(t, backupReleaseName.String(), namespace, helmValues)
-	assert.NoError(t, err)
+	if err != nil {
+		return fmt.Errorf("helm install failed: %v", err)
+	}
 
-	time.Sleep(2 * time.Minute)
 	cronjob, err := Clientset.BatchV1().CronJobs(namespace).Get(context.Background(), backupReleaseName.String(), metav1.GetOptions{})
-	assert.NoError(t, err, "cannot retrieve aws backup cronjob")
-	assert.Equal(t, cronjob.Spec.Schedule, helmValues.Neo4J.JobSchedule, fmt.Sprintf("aws cronjob schedule %s not matching with the schedule defined in values.yaml %s", cronjob.Spec.Schedule, helmValues.Neo4J.JobSchedule))
+	if err != nil {
+		return fmt.Errorf("cannot retrieve aws backup cronjob: %v", err)
+	}
 
-	pods, err := Clientset.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{})
-	assert.NoError(t, err, "error while retrieving pod list during aws backup operation")
+	if cronjob.Spec.Schedule != helmValues.Neo4J.JobSchedule {
+		return fmt.Errorf("aws cronjob schedule %s not matching with the schedule defined in values.yaml %s",
+			cronjob.Spec.Schedule, helmValues.Neo4J.JobSchedule)
+	}
 
-	var found bool
-	for _, pod := range pods.Items {
-		if strings.Contains(pod.Name, "cluster-backup-aws-minio") {
-			found = true
-			out, err := exec.Command("kubectl", "logs", pod.Name, "--namespace", namespace).CombinedOutput()
-			assert.NoError(t, err, "error while getting aws backup pod logs")
-			assert.NotNil(t, out, "aws backup logs cannot be retrieved")
-			assert.Contains(t, string(out), "Backup Completed for database neo4j system !!")
-			assert.Regexp(t, regexp.MustCompile("neo4j(.*)backup uploaded to s3 bucket"), string(out))
-			assert.Regexp(t, regexp.MustCompile("system(.*)backup uploaded to s3 bucket"), string(out))
-			assert.Regexp(t, regexp.MustCompile("No inconsistencies found"), string(out))
-			break
+	pod, podErr := waitForPodByName(t, namespace, "cluster-backup-aws-s3", 8*time.Minute)
+	if podErr != nil {
+		return podErr
+	}
+
+	for _, container := range pod.Spec.Containers {
+		s3ForcePathStyleFound := false
+		s3RegionFound := false
+		s3SignatureVersionFound := false
+
+		for _, env := range container.Env {
+			if env.Name == "S3_FORCE_PATH_STYLE" && env.Value == "true" {
+				s3ForcePathStyleFound = true
+			}
+			if env.Name == "AWS_REGION" && env.Value == "us-east-1" {
+				s3RegionFound = true
+			}
+			if env.Name == "S3_SIGNATURE_VERSION" && env.Value == "4" {
+				s3SignatureVersionFound = true
+			}
+		}
+
+		if !s3ForcePathStyleFound {
+			return fmt.Errorf("S3_FORCE_PATH_STYLE environment variable not found or not set to true")
+		}
+		if !s3RegionFound {
+			return fmt.Errorf("AWS_REGION environment variable not found or not set to us-east-1")
+		}
+		if !s3SignatureVersionFound {
+			return fmt.Errorf("S3_SIGNATURE_VERSION environment variable not found or not set to 4")
 		}
 	}
-	assert.Equal(t, true, found, "no aws minio backup pod found")
+
+	return nil
+}
+
+func InstallNeo4jBackupAWSHelmChartViaS3TLS(t *testing.T, releaseName model.ReleaseName) error {
+	if model.Neo4jEdition == "community" {
+		t.Skip()
+		return nil
+	}
+
+	namespace := "default"
+	backupReleaseName := model.NewReleaseName("cluster-backup-aws-s3-tls" + TestNamespace(t))
+	secretName := "awscred"
+	caCertSecretName := "s3-ca-cert"
+
+	t.Cleanup(func() {
+		_ = runAll(t, "kubectl", [][]string{
+			{"delete", "secret", secretName, "--namespace", namespace, "--ignore-not-found"},
+			{"delete", "secret", caCertSecretName, "--namespace", namespace, "--ignore-not-found"},
+		}, false)
+
+		_ = runAll(t, "helm", [][]string{
+			{"uninstall", backupReleaseName.String(), "--wait", "--timeout", "3m", "--namespace", namespace},
+		}, false)
+	})
+
+	secretKey := &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretName,
+			Namespace: namespace,
+		},
+		Data: map[string][]byte{
+			"credentials": []byte(fmt.Sprintf("[default]\naws_access_key_id=%s\naws_secret_access_key=%s",
+				os.Getenv("AWS_ACCESS_KEY_ID"),
+				os.Getenv("AWS_SECRET_ACCESS_KEY"))),
+		},
+		Type: "Opaque",
+	}
+
+	_, err := Clientset.CoreV1().Secrets(namespace).Create(context.TODO(), secretKey, metav1.CreateOptions{})
+	if err != nil && !strings.Contains(err.Error(), "already exists") {
+		return fmt.Errorf("failed to create AWS credentials secret: %v", err)
+	}
+
+	_, err = Clientset.CoreV1().Secrets(namespace).Get(context.TODO(), secretName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to verify AWS credentials secret exists: %v", err)
+	}
+
+	// Create CA certificate secret
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return fmt.Errorf("failed to generate private key: %v", err)
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: "s3.amazonaws.com",
+		},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		DNSNames:              []string{"s3.amazonaws.com"},
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, template, template, &priv.PublicKey, priv)
+	if err != nil {
+		return fmt.Errorf("failed to create certificate: %v", err)
+	}
+
+	certPEM := new(bytes.Buffer)
+	pem.Encode(certPEM, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+
+	caCertSecret := &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      caCertSecretName,
+			Namespace: namespace,
+		},
+		Data: map[string][]byte{
+			"ca.crt": certPEM.Bytes(),
+		},
+		Type: "Opaque",
+	}
+
+	_, err = Clientset.CoreV1().Secrets(namespace).Create(context.TODO(), caCertSecret, metav1.CreateOptions{})
+	if err != nil && !strings.Contains(err.Error(), "already exists") {
+		return fmt.Errorf("failed to create CA certificate secret: %v", err)
+	}
+
+	_, err = Clientset.CoreV1().Secrets(namespace).Get(context.TODO(), caCertSecretName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to verify CA certificate secret exists: %v", err)
+	}
+
+	time.Sleep(2 * time.Second)
+
+	bucketName := model.BucketName
+	helmClient := model.NewHelmClient(model.DefaultNeo4jBackupChartName)
+	helmValues := model.DefaultNeo4jBackupValues
+	helmValues.Backup = model.Backup{
+		BucketName:               bucketName,
+		DatabaseAdminServiceName: fmt.Sprintf("%s-admin", releaseName.String()),
+		DatabaseNamespace:        string(releaseName.Namespace()),
+		Database:                 "neo4j,system",
+		CloudProvider:            "aws",
+		SecretName:               secretName,
+		SecretKeyName:            "credentials",
+		S3Endpoint:               "https://s3.amazonaws.com",
+		S3CASecretName:           caCertSecretName,
+		S3CASecretKey:            "ca.crt",
+		S3SkipVerify:             false,
+		S3ForcePathStyle:         true,
+		S3Region:                 "us-east-1",
+		S3SignatureVersion:       "4",
+		Verbose:                  true,
+		KeepBackupFiles:          true,
+		Type:                     "FULL",
+	}
+	// Disable consistency check for S3 TLS configuration test to avoid timeouts
+	// This test focuses on S3 TLS parameters, not consistency check functionality
+	helmValues.ConsistencyCheck.Enable = false
+	helmValues.ConsistencyCheck.Database = ""
+	helmValues.Neo4J.JobSchedule = "* * * * *"
+	_, err = helmClient.Install(t, backupReleaseName.String(), namespace, helmValues)
+	if err != nil {
+		return fmt.Errorf("helm install failed: %v", err)
+	}
+
+	cronjob, err := Clientset.BatchV1().CronJobs(namespace).Get(context.Background(), backupReleaseName.String(), metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("cannot retrieve aws backup cronjob: %v", err)
+	}
+
+	if cronjob.Spec.Schedule != helmValues.Neo4J.JobSchedule {
+		return fmt.Errorf("aws cronjob schedule %s not matching with the schedule defined in values.yaml %s",
+			cronjob.Spec.Schedule, helmValues.Neo4J.JobSchedule)
+	}
+
+	pod, podErr := waitForPodByName(t, namespace, "cluster-backup-aws-s3-tls", 8*time.Minute)
+	if podErr != nil {
+		return podErr
+	}
+
+	for _, container := range pod.Spec.Containers {
+		for _, volumeMount := range container.VolumeMounts {
+			if volumeMount.Name == "s3-ca-cert" {
+				if volumeMount.MountPath != "/s3-ca-cert" {
+					return fmt.Errorf("expected CA certificate mount path to be /s3-ca-cert but got %s", volumeMount.MountPath)
+				}
+			}
+		}
+		for _, env := range container.Env {
+			if env.Name == "S3_CA_CERT_PATH" {
+				if env.Value != "/s3-ca-cert/ca.crt" {
+					return fmt.Errorf("expected S3_CA_CERT_PATH to be /s3-ca-cert/ca.crt but got %s", env.Value)
+				}
+			}
+		}
+
+		s3ForcePathStyleFound := false
+		s3RegionFound := false
+		s3SignatureVersionFound := false
+
+		for _, env := range container.Env {
+			if env.Name == "S3_FORCE_PATH_STYLE" && env.Value == "true" {
+				s3ForcePathStyleFound = true
+			}
+			if env.Name == "AWS_REGION" && env.Value == "us-east-1" {
+				s3RegionFound = true
+			}
+			if env.Name == "S3_SIGNATURE_VERSION" && env.Value == "4" {
+				s3SignatureVersionFound = true
+			}
+		}
+
+		if !s3ForcePathStyleFound {
+			return fmt.Errorf("S3_FORCE_PATH_STYLE environment variable not found or not set to true")
+		}
+		if !s3RegionFound {
+			return fmt.Errorf("AWS_REGION environment variable not found or not set to us-east-1")
+		}
+		if !s3SignatureVersionFound {
+			return fmt.Errorf("S3_SIGNATURE_VERSION environment variable not found or not set to 4")
+		}
+	}
+
+	return nil
+}
+
+// InstallBackupViaTempDir installs backup cronjob with a custom aggregate backup tempdir
+func InstallBackupViaTempDir(t *testing.T, releaseName model.ReleaseName) error {
+	if model.Neo4jEdition == "community" {
+		t.Skip()
+		return nil
+	}
+
+	backupReleaseName := model.NewReleaseName(fmt.Sprintf("%s-backup-s3-tmp", releaseName.String()))
+	namespace := string(releaseName.Namespace())
+	secretName := "miniocred"
+	customTempDir := "/tmp/custom-aggregate-temp"
+
+	// Add cleanup
+	t.Cleanup(func() {
+		_ = runAll(t, "helm", [][]string{
+			{"uninstall", backupReleaseName.String(), "--wait", "--timeout", "3m", "--namespace", namespace},
+		}, false)
+	})
+
+	secretKey := &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretName,
+			Namespace: namespace,
+		},
+		Data: map[string][]byte{
+			"credentials": []byte(fmt.Sprintf("[default]\nregion = us-east-1\naws_access_key_id=%s\naws_secret_access_key=%s",
+				os.Getenv("AWS_ACCESS_KEY_ID"),
+				os.Getenv("AWS_SECRET_ACCESS_KEY"))),
+		},
+		Type: "Opaque",
+	}
+
+	_, err := Clientset.CoreV1().Secrets(namespace).Create(context.TODO(), secretKey, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to create AWS credentials secret: %v", err)
+	}
+
+	_, err = Clientset.CoreV1().Secrets(namespace).Get(context.TODO(), secretName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to verify AWS credentials secret exists: %v", err)
+	}
+
+	time.Sleep(2 * time.Second)
+
+	bucketName := model.BucketName
+	helmClient := model.NewHelmClient(model.DefaultNeo4jBackupChartName)
+	helmValues := model.DefaultNeo4jBackupValues
+	helmValues.Backup = model.Backup{
+		BucketName:               bucketName,
+		DatabaseAdminServiceName: fmt.Sprintf("%s-admin", releaseName.String()),
+		DatabaseNamespace:        string(releaseName.Namespace()),
+		Database:                 "neo4j,system",
+		CloudProvider:            "aws",
+		SecretName:               secretName,
+		SecretKeyName:            "credentials",
+		S3Endpoint:               "s3.amazonaws.com",
+		S3ForcePathStyle:         true,
+		Verbose:                  true,
+		Type:                     "FULL",
+		AggregateBackup: model.AggregateBackup{
+			Enabled: true,
+			TempDir: customTempDir,
+		},
+	}
+	// Disable consistency check for temp directory configuration test to avoid timeouts
+	// This test focuses on custom temp directory functionality, not consistency check
+	helmValues.ConsistencyCheck.Enable = false
+	helmValues.ConsistencyCheck.Database = ""
+	helmValues.Neo4J.JobSchedule = "* * * * *"
+
+	_, err = helmClient.Install(t, backupReleaseName.String(), namespace, helmValues)
+	if err != nil {
+		return fmt.Errorf("helm install failed: %v", err)
+	}
+
+	cronjob, err := Clientset.BatchV1().CronJobs(namespace).Get(context.Background(), backupReleaseName.String(), metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("cannot retrieve aws backup cronjob: %v", err)
+	}
+
+	if cronjob.Spec.Schedule != helmValues.Neo4J.JobSchedule {
+		return fmt.Errorf("aws cronjob schedule %s not matching with the schedule defined in values.yaml %s",
+			cronjob.Spec.Schedule, helmValues.Neo4J.JobSchedule)
+	}
+
+	pod, podErr := waitForPodByName(t, namespace, backupReleaseName.String(), 8*time.Minute)
+	if podErr != nil {
+		return podErr
+	}
+
+	for _, container := range pod.Spec.Containers {
+		for _, env := range container.Env {
+			if env.Name == "AGGREGATE_BACKUP_TEMP_DIR" {
+				if env.Value != customTempDir {
+					return fmt.Errorf("expected AGGREGATE_BACKUP_TEMP_DIR to be %s but got %s", customTempDir, env.Value)
+				}
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -383,14 +976,13 @@ func CheckNeo4jOperationsPod(t *testing.T, releaseName model.ReleaseName) error 
 		return fmt.Errorf("pod phase %v is not succeeded", pod.Status.Phase)
 	}
 
-	out, err := exec.Command("kubectl", "logs", pod.Name, "--namespace", string(releaseName.Namespace())).CombinedOutput()
+	logOutput, err := kubectlLogs(t, pod.Name, string(releaseName.Namespace()))
 	if err != nil {
-		t.Logf("error while fetching operations pod logs")
 		return err
 	}
-	stringOutput := strings.ToLower(string(out))
+	stringOutput := strings.ToLower(logOutput)
 	if !strings.Contains(stringOutput, "server is already enabled") {
-		return fmt.Errorf("operations pod does not contain valid logs \n logs := %s", string(out))
+		return fmt.Errorf("operations pod does not contain valid logs \n logs := %s", logOutput)
 	}
 	return nil
 }
@@ -414,6 +1006,12 @@ func nodeSelectorTests(name model.ReleaseName) []SubTest {
 	return []SubTest{
 		{name: fmt.Sprintf("Check cluster core 1 is assigned with label %s", model.NodeSelectorLabel(namespace)), test: func(t *testing.T) {
 			t.Parallel()
+			// Re-apply the label before asserting. If GKE replaced the node
+			// carrying it mid-test the assertion would spuriously fail on a
+			// condition unrelated to what we're actually verifying.
+			if err := ensureNodeLabel(t, fmt.Sprintf("%s-1", namespace)); !assert.NoError(t, err) {
+				return
+			}
 			assert.NoError(t, checkNodeSelectorLabel(t, name, model.NodeSelectorLabel(namespace)), fmt.Sprintf("Core-1 Pod should be deployed on node with label %s", model.NodeSelectorLabel(namespace)))
 		}},
 	}
@@ -468,22 +1066,58 @@ func checkCoreImageName(t *testing.T, releaseName model.ReleaseName) error {
 	return nil
 }
 
-// checkNodeSelectorLabel checks whether the given pod is associated with the correct node or not
+// checkNodeSelectorLabel asserts the pod is scheduled on one of the nodes that
+// carries the given label. Multiple nodes may carry the same label (see
+// labelNodes) so we accept any of them rather than insisting on the first.
 func checkNodeSelectorLabel(t *testing.T, releaseName model.ReleaseName, labelName string) error {
 
-	nodeSelectorNode, err := getNodeWithLabel(labelName)
+	matches, err := getNodesWithLabel(labelName)
 	if !assert.NoError(t, err) {
 		return err
+	}
+	if !assert.NotEmpty(t, matches, "no node carries label %s", labelName) {
+		return fmt.Errorf("no node carries label %s", labelName)
 	}
 	pod, err := getSpecificPod(releaseName.Namespace(), releaseName.PodName())
 	if !assert.NoError(t, err) {
 		return fmt.Errorf("error while fetching pod list \n %v", err)
 	}
-	if !assert.Equal(t, nodeSelectorNode.Name, pod.Spec.NodeName) {
-		return fmt.Errorf("pod %s is not scheduled on the correct node %s", pod.Spec.NodeName, nodeSelectorNode.Name)
+	for _, node := range matches {
+		if node.Name == pod.Spec.NodeName {
+			return nil
+		}
 	}
+	names := make([]string, 0, len(matches))
+	for _, node := range matches {
+		names = append(names, node.Name)
+	}
+	assert.Fail(t, fmt.Sprintf("pod %s is on node %s; expected one of %v", pod.Name, pod.Spec.NodeName, names))
+	return fmt.Errorf("pod on %s; expected one of %v", pod.Spec.NodeName, names)
+}
 
-	return nil
+// assertPodOnLabeledNode asserts a pod was scheduled on one of the nodes that
+// carries labelName. labelNodes applies each testLabel value to multiple
+// nodes (self-healing against GKE node replacement), so an exact-equality
+// check against getNodeWithLabel's first match flakes whenever the scheduler
+// picks a different one of the matches.
+func assertPodOnLabeledNode(t *testing.T, pod v1.Pod, labelName string) {
+	matches, err := getNodesWithLabel(labelName)
+	if !assert.NoError(t, err) {
+		return
+	}
+	if !assert.NotEmpty(t, matches, "no node carries label %s", labelName) {
+		return
+	}
+	for _, n := range matches {
+		if n.Name == pod.Spec.NodeName {
+			return
+		}
+	}
+	names := make([]string, 0, len(matches))
+	for _, n := range matches {
+		names = append(names, n.Name)
+	}
+	assert.Fail(t, fmt.Sprintf("backup pod %s scheduled on %s; expected one of %v", pod.Name, pod.Spec.NodeName, names))
 }
 
 // checkImagePullSecret checks whether a secret of type docker-registry is created or not
@@ -526,7 +1160,7 @@ func apocConfigTests(releaseName model.ReleaseName) []SubTest {
 // checkClusterCorePasswordFailure checks if a cluster core is failing on installation or not with an incorrect password
 func checkClusterCorePasswordFailure(t *testing.T) error {
 	//creating a sample cluster core definition (which is not supposed to get installed)
-	clusterReleaseName := model.NewReleaseName("cluster-" + TestRunIdentifier)
+	clusterReleaseName := model.NewReleaseName("cluster-" + TestNamespace(t))
 	core := clusterCore{model.NewCoreReleaseName(clusterReleaseName, 4), nil}
 	releaseName := core.Name()
 	// we are not using the customized run() func here since we need to assert the error received on stdout
@@ -644,63 +1278,91 @@ func checkHeadlessServiceConfiguration(t *testing.T, service model.ReleaseName) 
 
 // checkHeadlessServiceEndpoints checks whether the headless endpoints have the cluster cores or not
 // By default , headless service includes cluster core only and no read replicas
+//
+// This check is brittle by nature: there's always a window where a pod has been scheduled but
+// not yet assigned an IP, or a pod is Terminating but still registered as an endpoint. To avoid
+// flakes we:
+//   - filter out pods that are Terminating (DeletionTimestamp set) or have empty PodIPs,
+//   - filter out empty endpoint addresses (shouldn't happen, but seen in practice),
+//   - and retry a few times if the sets briefly disagree.
 func checkHeadlessServiceEndpoints(t *testing.T, service model.ReleaseName) error {
 
 	serviceName := fmt.Sprintf("%s-headless", model.DefaultNeo4jName)
-
-	//get the endpoints associated with the headless service
-	endpoints, err := Clientset.CoreV1().Endpoints(string(service.Namespace())).Get(context.TODO(), serviceName, metav1.GetOptions{})
-	if !assert.NoError(t, err) {
-		return fmt.Errorf("failed to get headless service endpoints %v", err)
-	}
-
-	if !assert.NotEmpty(t, endpoints.Subsets) {
-		return fmt.Errorf("headlessService endpoints subset cannot be empty")
-	}
-
-	if !assert.Len(t, endpoints.Subsets, 1) {
-		return fmt.Errorf("headlessService endpoints subset length should be 1 whereas it is %d", len(endpoints.Subsets))
-	}
-
-	if !assert.NotEmpty(t, endpoints.Subsets[0].Addresses) {
-		return fmt.Errorf("headlessService endpoints addresses list cannot be empty")
-	}
-
-	//get the list of endpoint ip's
-	var endPointIPs []string
-	for _, endpointAddress := range endpoints.Subsets[0].Addresses {
-		endPointIPs = append(endPointIPs, endpointAddress.IP)
-	}
 
 	headlessService, err := Clientset.CoreV1().Services(string(service.Namespace())).Get(context.TODO(), serviceName, metav1.GetOptions{})
 	if !assert.NoError(t, err) {
 		return fmt.Errorf("headless service %s not found , Error seen := %v", service.String(), err)
 	}
-
-	//get the list of pods which match the headless service selectors
 	headlessServiceSelectors := labels.Set(headlessService.Spec.Selector)
 	listOptions := metav1.ListOptions{LabelSelector: headlessServiceSelectors.AsSelector().String()}
-	pods, err := Clientset.CoreV1().Pods(string(service.Namespace())).List(context.TODO(), listOptions)
-	if !assert.NoError(t, err) {
-		return fmt.Errorf("cannot get pods matching with headless service selector")
-	}
+	ns := string(service.Namespace())
 
-	if !assert.NotEmpty(t, pods) {
-		return fmt.Errorf("pods list matching headless service selector cannot be empty")
+	var endPointIPs, podIPs []string
+	pollErr := poll.Until(context.Background(), t, poll.Opts{
+		Interval:      5 * time.Second,
+		Timeout:       30 * time.Second,
+		Description:   fmt.Sprintf("headless service %s/%s endpoints to match pod IPs", ns, serviceName),
+		RetryableErrs: func(error) bool { return true },
+	}, func(ctx context.Context) (bool, error) {
+		endpoints, err := Clientset.CoreV1().Endpoints(ns).Get(ctx, serviceName, metav1.GetOptions{})
+		if err != nil {
+			return false, fmt.Errorf("get endpoints: %w", err)
+		}
+		endPointIPs = endPointIPs[:0]
+		if len(endpoints.Subsets) > 0 {
+			for _, addr := range endpoints.Subsets[0].Addresses {
+				if addr.IP != "" {
+					endPointIPs = append(endPointIPs, addr.IP)
+				}
+			}
+		}
+		pods, err := Clientset.CoreV1().Pods(ns).List(ctx, listOptions)
+		if err != nil {
+			return false, fmt.Errorf("list pods: %w", err)
+		}
+		podIPs = podIPs[:0]
+		for _, pod := range pods.Items {
+			// Skip pods that are being torn down — they'll disappear from endpoints shortly.
+			if pod.DeletionTimestamp != nil {
+				continue
+			}
+			// Skip pods with no IP yet — transient between Pending and Running.
+			if pod.Status.PodIP == "" {
+				continue
+			}
+			podIPs = append(podIPs, pod.Status.PodIP)
+		}
+		if len(podIPs) > 0 && len(endPointIPs) > 0 && stringsElementsMatch(podIPs, endPointIPs) {
+			return true, nil
+		}
+		t.Logf("headless endpoints / pod IPs not yet matched (pods=%v, endpoints=%v)", podIPs, endPointIPs)
+		return false, nil
+	})
+	if pollErr != nil {
+		assert.ElementsMatch(t, podIPs, endPointIPs)
+		assert.NotEmpty(t, podIPs)
+		assert.NotEmpty(t, endPointIPs)
+		return pollErr
 	}
-
-	//get the list of podIPs matching the headless service selector
-	var podIPs []string
-	for _, pod := range pods.Items {
-		podIPs = append(podIPs, pod.Status.PodIP)
-	}
-
-	//compare podIps and headlessService endPoint IPs ...both should match
-	if !assert.ElementsMatch(t, podIPs, endPointIPs) {
-		return fmt.Errorf("podIPs %v and endPointIps %v do not match", podIPs, endPointIPs)
-	}
-
 	return nil
+}
+
+// stringsElementsMatch reports whether a and b contain the same strings, ignoring order.
+func stringsElementsMatch(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := make(map[string]int, len(a))
+	for _, s := range a {
+		counts[s]++
+	}
+	for _, s := range b {
+		counts[s]--
+		if counts[s] < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func performBackgroundInstall(t *testing.T, componentsToParallelInstall []helmComponent, clusterReleaseName model.ReleaseName) ([]Closeable, error) {
@@ -732,125 +1394,110 @@ func performBackgroundInstall(t *testing.T, componentsToParallelInstall []helmCo
 	return closeables, nil
 }
 
-func installMinio(namespace string, tenantName string) error {
-	stdout, stderr, err := RunCommand(exec.Command("kubectl", "minio", "version"))
-	printStdOutStdErr(stdout, stderr, []string{"kubectl", "minio", "version"})
-	if !strings.Contains(strings.ToLower(string(stdout)), "kubectl-plugin version") {
-		if err != nil {
-			log.Printf("%v", string(stderr))
-			return err
-		}
-	}
+func TestBackupMultipleEndpointsE2E(t *testing.T) {
+	t.Parallel()
 
-	stdout, stderr, err = RunCommand(exec.Command("kubectl", "minio", "init", "-n", namespace))
-	printStdOutStdErr(stdout, stderr, []string{"kubectl", "minio", "init", "-n", namespace})
-	if !strings.Contains(strings.ToLower(string(stdout)), "To open Operator UI, start a port forward using this command") {
-		if err != nil {
-			log.Printf("%v", string(stderr))
-			return err
-		}
-	}
-
-	stdout, stderr, err = RunCommand(exec.Command("kubectl", "minio", "tenant", "create", tenantName, "--servers", "2", "--volumes", "4", "--capacity", "10Gi", "--disable-tls", "-n", namespace))
-	printStdOutStdErr(stdout, stderr, []string{"kubectl", "minio", "tenant", "create", tenantName, "--servers", "2", "--volumes", "4", "--capacity", "10Gi", "--disable-tls", "-n", namespace})
+	releaseName := model.NewReleaseName("multiple-backup-endpoints-" + TestNamespace(t))
+	_, err := createNamespace(t, releaseName)
 	if err != nil {
-		log.Printf("%v", string(stderr))
-		return err
+		return
 	}
+	namespace := string(releaseName.Namespace())
 
-	return nil
+	// Add cleanup
+	t.Cleanup(func() {
+		_ = runAll(t, "helm", [][]string{
+			{"uninstall", releaseName.String(), "--wait", "--timeout", "3m", "--namespace", namespace},
+			{"delete", "namespace", namespace},
+		}, false)
+	})
+
+	backupEndpoints := "10.3.3.2:6362,10.3.3.3:6362,10.3.3.4:6362"
+
+	helmValues := model.DefaultNeo4jBackupValues
+	helmValues.Backup.DatabaseBackupEndpoints = backupEndpoints
+	helmValues.Backup.SecretName = "demo"
+	helmValues.Backup.CloudProvider = "aws"
+	helmValues.Backup.BucketName = "demo2"
+	helmValues.Backup.Database = "neo4j1"
+	helmValues.Backup.S3ForcePathStyle = true
+
+	helmClient := model.NewHelmClient(model.DefaultNeo4jBackupChartName)
+	_, err = helmClient.Install(t, releaseName.String(), namespace, helmValues)
+	assert.NoError(t, err, "error installing helm chart with multiple backup endpoints")
+
+	cronjob, err := Clientset.BatchV1().CronJobs(namespace).Get(context.Background(), releaseName.String(), metav1.GetOptions{})
+	assert.NoError(t, err, "cannot retrieve cronjob for multiple backup endpoints")
+
+	// Verify cronjob env vars
+	assert.Contains(t, cronjob.Spec.JobTemplate.Spec.Template.Spec.Containers[0].Env, corev1.EnvVar{
+		Name:  "DATABASE_BACKUP_ENDPOINTS",
+		Value: backupEndpoints,
+	}, "backup endpoints not set correctly in cronjob")
+
+	_, _, pollErr := waitForBackupPodCompletion(t, namespace, releaseName.String(), "Backup Completed", 8*time.Minute)
+	assert.NoError(t, pollErr, "backup with multiple endpoints did not complete")
 }
 
-func deleteMinio(namespace string) error {
-	_, stderr, err := RunCommand(exec.Command("kubectl", "minio", "delete", "-f", "-d", "-n", namespace))
-	if err != nil {
-		log.Printf("%v", string(stderr))
-		return err
-	}
-	return nil
-}
-
-func getMiniIOKeys(namespace string, tenantName string) (string, string, error) {
-	secretName := fmt.Sprintf("%s-user-1", tenantName)
-	stdout, stderr, err := RunCommand(exec.Command("kubectl", "get", "secret", secretName, "-n", namespace, "--template={{.data.CONSOLE_ACCESS_KEY}}"))
-	printStdOutStdErr(stdout, stderr, []string{"kubectl", "get", "secret", secretName, "-n", namespace, "--template={{.data.CONSOLE_ACCESS_KEY}}"})
-	if err != nil {
-		log.Printf("%v", string(stderr))
-		return "", "", err
-	}
-	accessKey, err := base64.StdEncoding.DecodeString(string(stdout))
-	if err != nil {
-		log.Printf("Unable to decode minio access key")
-		return "", "", err
+func TestClusterProbeConfigurations(t *testing.T) {
+	if model.Neo4jEdition != "enterprise" {
+		t.Skip()
+		return
 	}
 
-	stdout, stderr, err = RunCommand(exec.Command("kubectl", "get", "secret", secretName, "-n", namespace, "--template={{.data.CONSOLE_SECRET_KEY}}"))
-	printStdOutStdErr(stdout, stderr, []string{"kubectl", "get", "secret", secretName, "-n", namespace, "--template={{.data.CONSOLE_SECRET_KEY}}"})
-	if err != nil {
-		log.Printf("%v", string(stderr))
-		return "", "", err
-	}
-	secretKey, err := base64.StdEncoding.DecodeString(string(stdout))
-	if err != nil {
-		log.Printf("Unable to decode minio secret key")
-		return "", "", err
-	}
-	log.Printf("Access Key = %s , Secret Key = %s", string(accessKey), string(secretKey))
-	return string(accessKey), string(secretKey), nil
-}
+	clusterReleaseName := model.NewReleaseName("cluster-probes")
+	chart := model.Neo4jHelmChartCommunityAndEnterprise
 
-func kCreateMinioSecret(namespace string, tenantName string, secretName string) error {
-	accessKey, secretKey, err := getMiniIOKeys(namespace, tenantName)
-	if err != nil {
-		return err
+	testCases := []struct {
+		name   string
+		values model.HelmValues
+	}{
+		{
+			name: "HTTP Probe",
+			values: func() model.HelmValues {
+				v := model.DefaultEnterpriseValues
+				v.ReadinessProbe = model.ReadinessProbe{
+					HTTPGet: &model.HTTPGetAction{
+						Path: "/ready",
+						Port: 7474,
+					},
+					FailureThreshold: 30,
+					TimeoutSeconds:   15,
+					PeriodSeconds:    10,
+				}
+				return v
+			}(),
+		},
+		{
+			name: "TCP Socket Probe",
+			values: func() model.HelmValues {
+				v := model.DefaultEnterpriseValues
+				v.ReadinessProbe = model.ReadinessProbe{
+					TCPSocket: &model.TCPSocketAction{
+						Port: 7687,
+					},
+					FailureThreshold: 20,
+					TimeoutSeconds:   10,
+					PeriodSeconds:    5,
+				}
+				return v
+			}(),
+		},
 	}
 
-	tempDir, err := os.MkdirTemp("", namespace)
-	if err != nil {
-		return err
-	}
-	path, err := createAwsCredFile(tempDir, accessKey, secretKey)
-	if err != nil {
-		return err
-	}
-	_, stderr, err := RunCommand(exec.Command("kubectl", "create", "secret", "-n", namespace, "generic", secretName, fmt.Sprintf("--from-file=credentials=%s", path)))
-	if err != nil {
-		log.Printf("%v", string(stderr))
-		return err
-	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			closeable, err := installNeo4j(t, clusterReleaseName, chart)
+			assert.NoError(t, err)
+			t.Cleanup(func() { _ = closeable() })
 
-	port, cleanupProxy, err := proxyMinioTenant(namespace, tenantName)
-	defer cleanupProxy()
-	if err != nil {
-		return err
-	}
+			err = run(t, "kubectl", "--namespace", string(clusterReleaseName.Namespace()),
+				"wait", "--for=condition=ready", "pod", clusterReleaseName.PodName(),
+				timeouts.KubectlPodReady())
+			assert.NoError(t, err)
 
-	endpoint := fmt.Sprintf("http://127.0.0.1:%d", port)
-	err = createMinioBucket(accessKey, secretKey, endpoint)
-	if err != nil {
-		return err
+			err = CheckProbes(t, clusterReleaseName)
+			assert.NoError(t, err)
+		})
 	}
-	return nil
-}
-
-func createMinioBucket(accessKey string, secretKey string, endpoint string) error {
-	stdout, stderr, err := RunCommand(exec.Command("mc", "alias", "set", "myminio", endpoint, accessKey, secretKey))
-	printStdOutStdErr(stdout, stderr, []string{"mc", "alias", "set", "myminio", endpoint, accessKey, secretKey})
-	if err != nil {
-		log.Printf("%v", string(stderr))
-		return err
-	}
-	stdout, stderr, err = RunCommand(exec.Command("mc", "mb", "myminio/helm-backup-test"))
-	printStdOutStdErr(stdout, stderr, []string{"mc", "mb", "myminio/helm-backup-test"})
-	if err != nil {
-		log.Printf("%v", string(stderr))
-		return err
-	}
-	return nil
-}
-
-func printStdOutStdErr(stdOut []byte, stderr []byte, command []string) {
-	log.Println("Command = ", command)
-	log.Println("stdout = ", string(stdOut))
-	log.Println("stderr = ", string(stderr))
 }

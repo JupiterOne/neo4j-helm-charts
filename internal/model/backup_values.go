@@ -1,19 +1,23 @@
 package model
 
 type Neo4jBackupValues struct {
-	NameOverride       string                 `yaml:"nameOverride,omitempty"`
-	FullnameOverride   string                 `yaml:"fullnameOverride,omitempty"`
-	DisableLookups     bool                   `yaml:"disableLookups" default:"false"`
-	Neo4J              Neo4jBackupNeo4j       `yaml:"neo4j"`
-	Backup             Backup                 `yaml:"backup"`
-	ConsistencyCheck   ConsistencyCheck       `yaml:"consistencyCheck"`
-	ServiceAccountName string                 `yaml:"serviceAccountName"`
-	TempVolume         map[string]interface{} `yaml:"tempVolume"`
-	SecurityContext    SecurityContext        `yaml:"securityContext"`
-	NodeSelector       map[string]string      `yaml:"nodeSelector,omitempty"`
-	Resources          Neo4jBackupResources   `yaml:"resources,omitempty"`
-	Tolerations        []Toleration           `yaml:"tolerations,omitempty"`
-	Affinity           Affinity               `yaml:"affinity,omitempty"`
+	NameOverride             string                   `yaml:"nameOverride,omitempty"`
+	FullnameOverride         string                   `yaml:"fullnameOverride,omitempty"`
+	DisableLookups           bool                     `yaml:"disableLookups" default:"false"`
+	Neo4J                    Neo4jBackupNeo4j         `yaml:"neo4j"`
+	Backup                   Backup                   `yaml:"backup"`
+	ConsistencyCheck         ConsistencyCheck         `yaml:"consistencyCheck"`
+	ServiceAccountName       string                   `yaml:"serviceAccountName"`
+	TempVolume               map[string]interface{}   `yaml:"tempVolume"`
+	SecurityContext          SecurityContext          `yaml:"securityContext"`
+	ContainerSecurityContext ContainerSecurityContext `yaml:"containerSecurityContext,omitempty"`
+	NodeSelector             map[string]string        `yaml:"nodeSelector,omitempty"`
+	Resources                Neo4jBackupResources     `yaml:"resources,omitempty"`
+	Tolerations              []Toleration               `yaml:"tolerations,omitempty"`
+	Affinity                 Affinity                   `yaml:"affinity,omitempty"`
+	ExtraEnvVars             []map[string]interface{}   `yaml:"extraEnvVars,omitempty"`
+	ExtraVolumes             []map[string]interface{}   `yaml:"extraVolumes,omitempty"`
+	ExtraVolumeMounts        []map[string]interface{}   `yaml:"extraVolumeMounts,omitempty"`
 }
 
 type Neo4jBackupResources struct {
@@ -55,6 +59,8 @@ type MatchExpressions struct {
 type Neo4jBackupNeo4j struct {
 	Image                      string            `yaml:"image" default:"neo4jbuildservice/helm-charts"`
 	ImageTag                   string            `yaml:"imageTag" default:"backup"`
+	Registry                   string            `yaml:"registry" default:""`
+	ImagePullSecrets           []string          `yaml:"imagePullSecrets,omitempty"`
 	PodLabels                  map[string]string `yaml:"podLabels,omitempty"`
 	PodAnnotations             map[string]string `yaml:"podAnnotations,omitempty"`
 	JobSchedule                string            `yaml:"jobSchedule" default:"* * * * *"`
@@ -65,28 +71,41 @@ type Neo4jBackupNeo4j struct {
 }
 
 type Backup struct {
-	BucketName               string          `yaml:"bucketName,omitempty"`
-	DatabaseAdminServiceName string          `yaml:"databaseAdminServiceName,omitempty"`
-	DatabaseAdminServiceIP   string          `yaml:"databaseAdminServiceIP,omitempty"`
-	DatabaseNamespace        string          `yaml:"databaseNamespace,omitempty" default:"default"`
-	DatabaseBackupPort       string          `yaml:"databaseBackupPort,omitempty" default:"6362"`
-	DatabaseClusterDomain    string          `yaml:"databaseClusterDomain,omitempty" default:"cluster.local"`
-	Database                 string          `yaml:"database,omitempty"`
-	AzureStorageAccountName  string          `yaml:"azureStorageAccountName,omitempty"`
-	CloudProvider            string          `yaml:"cloudProvider,omitempty"`
-	MinioEndpoint            string          `yaml:"minioEndpoint,omitempty"`
-	SecretName               string          `yaml:"secretName,omitempty"`
-	SecretKeyName            string          `yaml:"secretKeyName,omitempty"`
-	PageCache                string          `yaml:"pageCache,omitempty"`
-	HeapSize                 string          `yaml:"heapSize,omitempty"`
-	FallbackToFull           bool            `yaml:"fallbackToFull" default:"true"`
-	IncludeMetadata          string          `yaml:"includeMetadata,omitempty"`
-	Type                     string          `yaml:"type,omitempty"`
-	KeepFailed               bool            `yaml:"keepFailed" default:"false"`
-	ParallelRecovery         bool            `yaml:"parallelRecovery" default:"false"`
-	KeepBackupFiles          bool            `yaml:"keepBackupFiles" default:"true"`
-	Verbose                  bool            `yaml:"verbose" default:"true"`
-	AggregateBackup          AggregateBackup `yaml:"aggregate,omitempty"`
+	BucketName                   string          `yaml:"bucketName,omitempty"`
+	DatabaseAdminServiceName     string          `yaml:"databaseAdminServiceName,omitempty"`
+	DatabaseAdminServiceIP       string          `yaml:"databaseAdminServiceIP,omitempty"`
+	DatabaseNamespace            string          `yaml:"databaseNamespace,omitempty" default:"default"`
+	DatabaseBackupPort           string          `yaml:"databaseBackupPort,omitempty" default:"6362"`
+	DatabaseClusterDomain        string          `yaml:"databaseClusterDomain,omitempty" default:"cluster.local"`
+	DatabaseBackupEndpoints      string          `yaml:"databaseBackupEndpoints,omitempty"`
+	Database                     string          `yaml:"database,omitempty"`
+	AzureStorageAccountName      string          `yaml:"azureStorageAccountName,omitempty"`
+	AzureBlobServiceURL          string          `yaml:"azureBlobServiceURL,omitempty"`
+	CloudProvider                string          `yaml:"cloudProvider,omitempty"`
+	S3Endpoint                   string          `yaml:"s3Endpoint,omitempty"`
+	S3CASecretName               string          `yaml:"s3CASecretName,omitempty"`
+	S3CASecretKey                string          `yaml:"s3CASecretKey,omitempty"`
+	S3SkipVerify                 bool            `yaml:"s3SkipVerify,omitempty" default:"false"`
+	S3ForcePathStyle             bool            `yaml:"s3ForcePathStyle" default:"true"`
+	S3Region                     string          `yaml:"s3Region,omitempty"`
+	S3SignatureVersion           string          `yaml:"s3SignatureVersion,omitempty"`
+	S3RequestChecksumCalculation string          `yaml:"s3RequestChecksumCalculation,omitempty"`
+	S3ResponseChecksumValidation string          `yaml:"s3ResponseChecksumValidation,omitempty"`
+	S3DisableMultipartChecksums  bool            `yaml:"s3DisableMultipartChecksums,omitempty" default:"false"`
+	SecretName                   string          `yaml:"secretName,omitempty"`
+	SecretKeyName                string          `yaml:"secretKeyName,omitempty"`
+	PageCache                    string          `yaml:"pageCache,omitempty"`
+	HeapSize                     string          `yaml:"heapSize,omitempty"`
+	IncludeMetadata              string          `yaml:"includeMetadata,omitempty"`
+	Type                         string          `yaml:"type,omitempty"`
+	KeepFailed                   bool            `yaml:"keepFailed" default:"false"`
+	ParallelRecovery             bool            `yaml:"parallelRecovery" default:"false"`
+	KeepBackupFiles              bool            `yaml:"keepBackupFiles" default:"true"`
+	Verbose                      bool            `yaml:"verbose" default:"true"`
+	AggregateBackup              AggregateBackup `yaml:"aggregate,omitempty"`
+	Compress                     bool            `yaml:"compress" default:"true"`
+	TempDir                      string          `yaml:"tempDir,omitempty"`
+	RemoteAddressResolution      bool            `yaml:"remoteAddressResolution" default:"false"`
 }
 
 type AggregateBackup struct {
@@ -96,6 +115,7 @@ type AggregateBackup struct {
 	ParallelRecovery bool   `yaml:"parallelRecovery" default:"false"`
 	FromPath         string `yaml:"fromPath"`
 	Database         string `yaml:"database"`
+	TempDir          string `yaml:"tempDir"`
 }
 
 type ConsistencyCheck struct {
@@ -108,6 +128,8 @@ type ConsistencyCheck struct {
 	MaxOffHeapMemory    string `yaml:"maxOffHeapMemory,omitempty"`
 	Threads             string `yaml:"threads,omitempty"`
 	Verbose             bool   `yaml:"verbose" default:"true"`
+	TempDir             string `yaml:"tempDir,omitempty"`
+	Timeout             string `yaml:"timeout,omitempty"`
 }
 
 type Toleration struct {
@@ -115,4 +137,13 @@ type Toleration struct {
 	Operator string `yaml:"operator,omitempty"`
 	Value    string `yaml:"value,omitempty"`
 	Effect   string `yaml:"effect,omitempty"`
+}
+
+type ContainerSecurityContext struct {
+	RunAsNonRoot             bool         `yaml:"runAsNonRoot,omitempty"`
+	RunAsUser                int64        `yaml:"runAsUser,omitempty"`
+	RunAsGroup               int64        `yaml:"runAsGroup,omitempty"`
+	ReadOnlyRootFilesystem   bool         `yaml:"readOnlyRootFilesystem,omitempty"`
+	AllowPrivilegeEscalation bool         `yaml:"allowPrivilegeEscalation,omitempty"`
+	Capabilities             Capabilities `yaml:"capabilities,omitempty"`
 }

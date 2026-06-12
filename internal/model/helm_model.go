@@ -163,6 +163,8 @@ var DefaultNeo4jBackupValues = Neo4jBackupValues{
 	Neo4J: Neo4jBackupNeo4j{
 		Image:                      strings.Split(os.Getenv("NEO4J_DOCKER_BACKUP_IMG"), ":")[0],
 		ImageTag:                   strings.Split(os.Getenv("NEO4J_DOCKER_BACKUP_IMG"), ":")[1],
+		Registry:                   "",
+		ImagePullSecrets:           []string{},
 		JobSchedule:                "* * * * *",
 		SuccessfulJobsHistoryLimit: 3,
 		FailedJobsHistoryLimit:     3,
@@ -185,6 +187,16 @@ var DefaultNeo4jBackupValues = Neo4jBackupValues{
 		RunAsGroup:          7474,
 		FsGroup:             7474,
 		FsGroupChangePolicy: "Always",
+	},
+	ContainerSecurityContext: ContainerSecurityContext{
+		RunAsNonRoot:             true,
+		RunAsUser:                7474,
+		RunAsGroup:               7474,
+		ReadOnlyRootFilesystem:   false,
+		AllowPrivilegeEscalation: false,
+		Capabilities: Capabilities{
+			Drop: []string{"ALL"},
+		},
 	},
 }
 
