@@ -159,6 +159,7 @@ E.g. by adding `--set podSpec.loadbalancer=include`
 
     {{- end -}}
 
+    {{- $usesFullFormat := and $isCPUSet $isMemorySet }}
 
     {{- if not $isCPUSet }}
         {{- if kindIs "invalid" .Values.neo4j.resources.cpu -}}
@@ -179,8 +180,8 @@ E.g. by adding `--set podSpec.loadbalancer=include`
     {{- $requests := dict "cpu" $cpu "memory" $memory -}}
     {{- $ignored := set .Values.neo4j.resources "requests" $requests -}}
 
-    {{/* set limits as same as cpu and memory if not provided by the user */}}
-    {{- if kindIs "invalid" .Values.neo4j.resources.limits -}}
+    {{/* only auto-set limits when user uses shorthand or mixed format; full format allows omitting limits */}}
+    {{- if and (kindIs "invalid" .Values.neo4j.resources.limits) (not $usesFullFormat) -}}
        {{- $ignored := set .Values.neo4j.resources "limits" $requests -}}
     {{- end -}}
 
@@ -189,7 +190,7 @@ E.g. by adding `--set podSpec.loadbalancer=include`
 {{- define "neo4j.resources.evaluateCPU" -}}
 
     {{/* check regex here :- https://regex101.com/r/wJsFcO/1 */}}
-    {{ $cpuRegex := "(^\\d+)((\\.?[^\\.a-zA-Z])?)([0-9]*m?$)" }}
+    {{- $cpuRegex := "(^\\d+)((\\.?[^\\.a-zA-Z])?)([0-9]*m?$)" }}
 
     {{- $cpu := .Values.neo4j.resources.requests.cpu | toString }}
 
@@ -215,7 +216,7 @@ E.g. by adding `--set podSpec.loadbalancer=include`
 
 {{- define "neo4j.resources.evaluateMemory" -}}
     {{/* check regex here :- https://regex101.com/r/68NEQV/1 */}}
-    {{ $memoryRegex := "(^\\d+)((\\.?[^\\.a-zA-Z\\s])?)(\\d*)(([EkMGTP]?|[EKMGTP]i?|e[+-]?\\d*[EKMGTP]?)$)" -}}
+    {{- $memoryRegex := "(^\\d+)((\\.?[^\\.a-zA-Z\\s])?)(\\d*)(([EkMGTP]?|[EKMGTP]i?|e[+-]?\\d*[EKMGTP]?)$)" -}}
 
     {{- $memory := .Values.neo4j.resources.requests.memory | toString }}
 
@@ -233,7 +234,7 @@ E.g. by adding `--set podSpec.loadbalancer=include`
 
     {{/* Mininum 2Gi or 2Gb, Converting the value type to Gb or Gi */}}
 
-    {{/* 1kilo = 0.000001G */}}
+    {{- /* 1kilo = 0.000001G */}}
     {{- if or (contains "K" $memory) (contains "k" $memory) -}}
         {{ $memoryFloat = divf ($memory | replace "K" "" | float64) 1000000 -}}
 
@@ -485,4 +486,16 @@ startupProbe:
   {{- end }}
   failureThreshold: {{ .failureThreshold | default 1000 }}
   periodSeconds: {{ .periodSeconds | default 5 }}
+{{- end -}}
+
+{{/*
+Resolve the actual service account name to use
+Returns the custom service account name if provided, otherwise the auto-generated name
+*/}}
+{{- define "neo4j.serviceAccountName" -}}
+    {{- if and (kindIs "string" $.Values.podSpec.serviceAccountName) $.Values.podSpec.serviceAccountName -}}
+        {{- $.Values.podSpec.serviceAccountName -}}
+    {{- else -}}
+        {{- include "neo4j.fullname" . -}}
+    {{- end -}}
 {{- end -}}
